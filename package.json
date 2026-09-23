@@ -1,0 +1,52 @@
+{
+  "name": "pi-lxmf",
+  "version": "0.1.0",
+  "description": "Drive the Pi coding agent over LXMF messaging (Reticulum mesh) from a headless server.",
+  "license": "EUPL-1.2",
+  "author": "Henri Bergius <henri.bergius@iki.fi>",
+  "type": "module",
+  "main": "src/bridge.js",
+  "bin": {
+    "pi-lxmf": "src/bin.js"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "reticulum",
+    "rns",
+    "lxmf",
+    "mesh",
+    "bot"
+  ],
+  "files": [
+    "src",
+    "CHANGELOG.md",
+    "SPEC.md"
+  ],
+  "scripts": {
+    "start": "node src/bin.js",
+    "lint": "biome check --use-editorconfig=true src/ test/ scripts/",
+    "format": "biome check --use-editorconfig=true --write src/ test/ scripts/",
+    "types": "tsc",
+    "test": "node --test --test-force-exit test/*.test.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@digitaldefiance/bzip2-wasm": "^1.1.1",
+    "@reticulum/core": "^0.9.0",
+    "@reticulum/lxmf": "^0.9.0",
+    "@reticulum/node": "^0.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/bergie/pi-lxmf.git"
+  },
+  "rngit": "rns://adafb3153efd4d96d532568a5208b3b5/reticulum/pi-lxmf"
+}
