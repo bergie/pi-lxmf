@@ -54,6 +54,7 @@ const REACTION_DEBOUNCE_MS = 2000;
  * @property {EventTarget} lxmf - The LXMRouter (dispatches "message" events).
  * @property {(destHex: string, text: string, opts?: {link?: any, title?: string}) => Promise<void>} sendText
  * @property {(destHex: string, targetMessageId: Uint8Array, emoji: string, opts?: {link?: any}) => Promise<void>} sendReaction
+ * @property {(message: any) => Promise<"verified"|"unknown"|"invalid">} verifySender
  * @property {string} identityHash
  * @property {string} deliveryHash
  */
@@ -201,7 +202,14 @@ export class Bridge {
   }
 
   /**
-   * Handles one inbound (signature-verified) LXMF message event.
+   * Handles one inbound LXMF message event.
+   *
+   * The router signature-verifies on the direct-delivery path, but a message
+   * pulled in via propagation-node sync is dispatched without verification
+   * when the sender's identity is not yet recalled. The owner-hash check
+   * alone is forgeable on that path (a 16-byte hash, no private key needed),
+   * so we re-verify the signature here regardless of delivery path and drop
+   * anything that isn't cryptographically proven to be the owner's.
    *
    * @param {{detail?: {message?: any, link?: any}}} event
    */
@@ -220,6 +228,37 @@ export class Bridge {
       return;
     }
 
+    // Serialize all inbound handling so prompts and commands keep order.
+    // The signature verification happens inside the queue (it is async) so
+    // the queue chain is set synchronously here — callers awaiting
+    // `bridge.queue` see this message's run.
+    const run = this.queue
+      .then(() => this.admitMessage(message, link))
+      .catch((e) => {
+        this.log.error(`pi-lxmf: inbound handling failed: ${errorText(e)}`);
+      });
+    this.queue = run;
+  }
+
+  /**
+   * Verifies the signature of an inbound owner message (closing the
+   * propagation-sync verification gap — see {@link onLxmfMessage}) and, if
+   * it checks out, processes it. The owner-hash check has already run.
+   *
+   * @param {any} message
+   * @param {any} link
+   */
+  async admitMessage(message, link) {
+    // Cryptographic proof that the sender holds the owner's private key.
+    // `unknown` (sender identity not recalled yet, e.g. a synced message
+    // whose announce hasn't arrived) is treated as unverified and dropped —
+    // a re-sync after the announce lands will re-deliver it.
+    const proof = await this.mesh.verifySender(message);
+    if (proof !== "verified") {
+      this.log.log(`pi-lxmf: inbound from owner: dropped (signature ${proof})`);
+      return;
+    }
+
     const content =
       typeof message.content === "string" ? message.content.trim() : "";
     if (!content) {
@@ -228,14 +267,7 @@ export class Bridge {
     }
     this.lastLink = link ?? this.lastLink;
     this.lastTriggerMessageId = message.messageId ?? null;
-
-    // Serialize all inbound handling so prompts and commands keep order.
-    const run = this.queue
-      .then(() => this.processInbound(content, link))
-      .catch((e) => {
-        this.log.error(`pi-lxmf: inbound handling failed: ${errorText(e)}`);
-      });
-    this.queue = run;
+    await this.processInbound(content, link);
   }
 
   /**

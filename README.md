@@ -147,10 +147,16 @@ retrieves messages that arrived while the daemon was down.
 
 ## Security
 
-- Inbound LXMF messages are **signature-verified by the router**; only
-  messages from the configured owner's identity are processed (matched via
-  the derived `lxmf.delivery` destination hash), everyone else is dropped
-  silently — the daemon never answers strangers.
+- Every inbound owner message is **signature-verified by the bridge**
+  (recalling the sender identity and checking the LXMF signature) before
+  it is processed; only messages from the configured owner's identity get
+  through (matched via the derived `lxmf.delivery` destination hash),
+  everyone else is dropped silently — the daemon never answers strangers.
+  The router itself only verifies signatures on direct delivery, so the
+  bridge re-checks every path (including propagation-node sync, where the
+  router dispatches unverified when the sender identity is unknown) — the
+  owner source hash alone is forgeable, so the cryptographic proof is what
+  actually authenticates the sender.
 - The owner is **configured, never learned**: there is no first-contact
   pairing, so a stray message can never seize control.
 - Access is keyed by **identity hash**, so it can later be delegated to a

@@ -153,7 +153,11 @@ example:
    msgpack app-data makes Sideband display the name.
 6. **Receiving.** `message` events carry a signature-verified `LXMessage`
    (`detail.message`) and the link id (`detail.link`). The router already
-   deduplicates by LXMF message id within a process lifetime.
+   deduplicates by LXMF message id within a process lifetime. Note: the
+   router only verifies signatures on the direct-delivery path — a message
+   pulled in via propagation sync (step 8) whose sender identity is not yet
+   recalled is dispatched unverified, so the bridge re-verifies every
+   inbound owner message itself (see §11).
 7. **Sending.** Replies are `LXMessage`s from our `deliveryDest` to the
    owner's LXMF address (their `lxmf.delivery` destination hash), sent with
    `lxmf.send(reply, identity, link)` — reusing the inbound link when one
@@ -362,11 +366,19 @@ repository exists on the node.
 
 - **Owner-only control, configured not learned.** Exactly one Reticulum
   identity (configured by identity hash; see §6.1) can drive the agent.
-  Inbound LXMF messages are signature-verified by `LXMRouter` before
-  dispatch, so the source is authenticated. There is no first-contact
-  pairing: a stray message can never seize control, and the daemon never
-  answers strangers. Identity-keyed access is ready for delegation to
-  DACAR-based permission management (§13) without reconfiguration.
+  The bridge signature-verifies every inbound owner message itself before
+  processing (`mesh.verifySender`, recalling the sender identity and
+  checking the LXMF signature). This is necessary because the router only
+  verifies signatures on the direct-delivery path: a message pulled in via
+  propagation-node sync whose sender identity is not yet recalled is
+  dispatched without verification, and the owner source-hash check alone is
+  forgeable on that path (a 16-byte hash, no private key needed). An
+  unverified message — including one whose sender identity is unknown
+  ("parked") — is dropped; a re-sync after the owner's announce lands will
+  re-deliver it. There is no first-contact pairing: a stray message can
+  never seize control, and the daemon never answers strangers. Identity-
+  keyed access is ready for delegation to DACAR-based permission management
+  (§13) without reconfiguration.
 - **No shell surface.** The bridge never executes chat text locally; only
   Pi's RPC commands are used. The agent's own tool use is governed by Pi's
   normal permissions, not relaxed by the bridge. Declined dialogs mean

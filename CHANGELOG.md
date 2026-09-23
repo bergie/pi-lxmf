@@ -72,5 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compressed data) threw `BZ_OUTBUFF_FULL` and failed delivery. The adapter
   now sizes the output buffer with bzip2's documented worst-case headroom
   (`input + 1% + 600` bytes).
+- Security: the bridge now signature-verifies every inbound owner message
+  itself, closing a gap on the propagation-sync path. The router verifies
+  signatures on direct delivery, but a message pulled in via
+  `syncFromPropagationNode` whose sender identity is not yet recalled is
+  dispatched WITHOUT verification (mirroring Python's `SOURCE_UNKNOWN`
+  handling) — and the bridge's owner-hash check alone is forgeable there
+  (a 16-byte hash, no private key needed). The bridge now calls
+  `verifySender(message)` on the mesh adapter (recalls the sender identity
+  and checks the signature) and drops anything that isn't cryptographically
+  proven, including `unknown` (parked) results, so a synced message is only
+  admitted once the owner's identity has been learned. This makes the
+  SPEC.md §11 / README "signature-verified" claim hold for every path.
 - GitHub Actions CI: tests (with lint and type checks) on every push, and
   OIDC-based npm publishing on tag pushes (no registry token stored).

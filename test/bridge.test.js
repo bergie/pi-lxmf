@@ -176,6 +176,8 @@ class FakeMesh {
     this.reactions = [];
     this.identityHash = "1".repeat(32);
     this.deliveryHash = "2".repeat(32);
+    /** @type {"verified"|"unknown"|"invalid"|null} */
+    this.verifyResult = null;
   }
 
   get lxmf() {
@@ -199,6 +201,14 @@ class FakeMesh {
    */
   async sendReaction(destinationHex, targetMessageId, emoji, options = {}) {
     this.reactions.push({ destinationHex, targetMessageId, emoji, options });
+  }
+
+  /**
+   * @param {any} _message
+   * @returns {Promise<"verified"|"unknown"|"invalid">}
+   */
+  async verifySender(_message) {
+    return this.verifyResult ?? "verified";
   }
 
   /**
@@ -337,6 +347,30 @@ test("steer race: rejected idle prompt is retried queued", async () => {
 test("non-owner messages are dropped silently", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
   mesh.emitMessage({ sourceHash: STRANGER_DEST, content: "let me in" });
+  await bridge.queue;
+  await sleep(10);
+  assert.equal(rpc.prompts.length, 0);
+  assert.equal(mesh.sent.length, 0);
+});
+
+test("unverified owner message (synced, unknown identity) is dropped", async () => {
+  // A propagation-node sync can deliver a message from the owner's source
+  // hash WITHOUT a verified signature (the router skips verification when
+  // the sender identity isn't recalled). The owner hash alone is forgeable,
+  // so the bridge must drop an unverified message even if the hash matches.
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  mesh.verifyResult = "unknown";
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "forged hash" });
+  await bridge.queue;
+  await sleep(10);
+  assert.equal(rpc.prompts.length, 0);
+  assert.equal(mesh.sent.length, 0);
+});
+
+test("invalid-signature owner message is dropped", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  mesh.verifyResult = "invalid";
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "tampered" });
   await bridge.queue;
   await sleep(10);
   assert.equal(rpc.prompts.length, 0);

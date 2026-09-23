@@ -117,6 +117,7 @@ export function attachInboundDiagnostics(lxmf, log = () => {}) {
  *   interfaceNames: string[],
  *   sendText: (destinationHex: string, text: string, options?: {link?: any, title?: string}) => Promise<void>,
  *   sendReaction: (destinationHex: string, targetMessageId: Uint8Array, emoji: string, options?: {link?: any}) => Promise<void>,
+ *   verifySender: (message: LXMessage) => Promise<"verified"|"unknown"|"invalid">,
  *   stop: () => void
  * }>}
  */
@@ -323,6 +324,28 @@ export async function startLxmf(config, options = {}) {
     }
   }
 
+  /**
+   * Verifies the signature of an inbound `message` against the sender's
+   * recalled identity. The router verifies signatures on the direct-delivery
+   * path, but a message pulled in via `syncFromPropagationNode` whose sender
+   * identity is not yet recalled is dispatched WITHOUT verification
+   * (mirroring Python's `SOURCE_UNKNOWN` handling). The bridge must not rely
+   * on the router for this on the sync path, so it calls here to close the
+   * gap: a message is admitted only when this returns `"verified"`.
+   *
+   * @param {LXMessage} message
+   * @returns {Promise<"verified"|"unknown"|"invalid">}
+   *   `"verified"` — signature checks against the recalled sender identity.
+   *   `"unknown"`   — sender identity not recalled (parked); admission would
+   *                  be unverified, so the caller should drop and log.
+   *   `"invalid"`   — signature failed cryptographic proof.
+   */
+  async function verifySender(message) {
+    const sender = await lxmf.rns.transport.recallIdentity(message.sourceHash);
+    if (!sender) return "unknown";
+    return (await message.verifySignature(sender)) ? "verified" : "invalid";
+  }
+
   return {
     rns,
     lxmf,
@@ -332,6 +355,7 @@ export async function startLxmf(config, options = {}) {
     interfaceNames,
     sendText,
     sendReaction,
+    verifySender,
     stop() {
       detachDiagnostics();
       lxmf.stopAnnouncing();
