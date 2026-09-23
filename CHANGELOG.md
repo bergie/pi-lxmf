@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- z.ai GLM quota watcher + peak-hours warning (`src/quota.js`, work doc #3):
+  when the active model is a z.ai GLM model (`provider === "zai"`), the
+  bridge watches the z.ai quota endpoint (`pi-glm-usage`'s) and delivers
+  exactly one LXMF message to the owner the moment the 5h quota bucket
+  recovers after a quota-exhausted run failure. Also warns the owner at
+  run start (and when the window opens mid-run) during z.ai peak hours
+  (Mon–Fri 14:00–18:00 SGT / UTC+8, 3× token cost). Entirely gated on
+  the active model being `zai` — nothing fires for Cortecs/Anthropic/etc.
+  A missing `zai.key` disables the watcher gracefully.
+
 - Initial implementation of the `pi-lxmf` bridge: an LXMF ↔ Pi RPC daemon per
   `SPEC.md`.
   - `PiRpcClient` (`src/rpc.js`): spawns and supervises `pi --mode rpc`,

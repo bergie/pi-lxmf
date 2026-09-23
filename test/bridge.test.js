@@ -9,6 +9,7 @@ import { test } from "node:test";
 
 import { Bridge } from "../src/bridge.js";
 import { deriveLxmfDestinationHash } from "../src/identity.js";
+import { GlmQuotaWatcher } from "../src/quota.js";
 
 // The owner is configured by Reticulum IDENTITY hash; the wire carries the
 // derived lxmf.delivery destination hashes.
@@ -261,6 +262,7 @@ class FakeState {
  * @param {object} [options]
  * @param {any} [options.config]
  * @param {string} [options.owner]
+ * @param {import("../src/quota.js").GlmQuotaWatcher} [options.quotaWatcher]
  * @param {Function} [options.onShutdown]
  */
 function makeBridge(options = {}) {
@@ -280,6 +282,7 @@ function makeBridge(options = {}) {
     rpc: /** @type {any} */ (rpc),
     mesh,
     state,
+    quotaWatcher: options.quotaWatcher,
     log: { log: () => {}, error: () => {} },
     onShutdown: (reason) => shutdowns.push(reason),
   });
@@ -791,4 +794,168 @@ test("reaction is not sent when the trigger has no messageId", async () => {
   rpc.emitEvent({ type: "agent_start" });
   await sleep(30);
   assert.equal(mesh.reactions.length, 0);
+});
+
+test("GLM quota watcher is gated on the active model being zai", async () => {
+  // Non-zai model: the bridge-constructed watcher stays disabled and a
+  // quota error never arms it. Covered fully by the dedicated test below;
+  // this asserts the bridge tolerates a missing watcher (null) too.
+  const { bridge } = makeBridge({ owner: OWNER });
+  assert.equal(bridge.quotaWatcher, null);
+  bridge.observeState({
+    model: { provider: "cortecs", id: "claude-opus-5.5" },
+  });
+  // No throw: observeState must guard on quotaWatcher being null.
+  assert.equal(bridge.activeModel?.provider, "cortecs");
+});
+
+test("quota-recovery notification delivers to the owner on a zai model", async () => {
+  // Construct a bridge WITH the watcher so observeState gates it.
+  const rpc = new FakeRpc();
+  const mesh = new FakeMesh();
+  const state = new FakeState();
+  /** @type {{fiveHourPct: number, weeklyPct: number}} */
+  const live = { fiveHourPct: 100, weeklyPct: 12 };
+  /** @param {string} _url @param {{headers?: any}} [opts] */
+  const fetchImpl = async (_url, opts) => ({
+    ok: true,
+    json: async () => ({
+      code: 200,
+      data: {
+        limits: [
+          {
+            type: "TOKENS_LIMIT",
+            unit: 3,
+            percentage: live.fiveHourPct,
+            nextResetTime: 0,
+          },
+          {
+            type: "TOKENS_LIMIT",
+            unit: 6,
+            percentage: live.weeklyPct,
+            nextResetTime: 0,
+          },
+        ],
+        level: "pro",
+      },
+    }),
+  });
+  let clock = Date.UTC(2026, 8, 28, 12, 0, 0);
+  const watcher = new GlmQuotaWatcher({
+    ownerDestinationHash: OWNER_DEST,
+    sendText: async (destHex, text) =>
+      mesh.sendText(destHex, text, { title: "test-node" }),
+    log: { log: () => {}, error: () => {} },
+    apiKey: "key",
+    fetchImpl: /** @type {any} */ (fetchImpl),
+    now: () => clock,
+    pollIntervalMs: 5,
+  });
+  const bridge = new Bridge({
+    config: /** @type {any} */ ({
+      midRunBehavior: "steer",
+      chunkChars: 2500,
+      name: "test-node",
+      owner: OWNER,
+    }),
+    rpc: /** @type {any} */ (rpc),
+    mesh,
+    state,
+    quotaWatcher: watcher,
+    log: { log: () => {}, error: () => {} },
+    onShutdown: () => {},
+  });
+  bridge.start();
+  bridge.setRpcReady(true);
+
+  // Active model is zai: observeState enables the watcher.
+  rpc.states.push({ model: { provider: "zai", id: "glm-5.3-flash" } });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "work" });
+  await bridge.queue;
+  await sleep(5);
+  assert.equal(watcher.enabled, true, "watcher enabled for zai model");
+
+  // A quota error arms the poller.
+  rpc.emitEvent({ type: "agent_start" });
+  rpc.emitEvent({
+    type: "auto_retry_end",
+    success: false,
+    finalError: "403 quota exceeded",
+  });
+  await sleep(5);
+  assert.equal(watcher.wasExhausted, true);
+
+  // Recover: advance the clock + flip the bucket.
+  clock += 60 * 60_000;
+  live.fiveHourPct = 20;
+  await sleep(25);
+  const notify = mesh.sent.find((s) => /5h quota available/.test(s.text));
+  assert.ok(notify, "recovery notification delivered to owner");
+  assert.equal(notify.destinationHex, OWNER_DEST);
+  watcher.stop();
+});
+
+test("quota watcher is disabled when active model is not zai", async () => {
+  const rpc = new FakeRpc();
+  const mesh = new FakeMesh();
+  const state = new FakeState();
+  const watcher = new GlmQuotaWatcher({
+    ownerDestinationHash: OWNER_DEST,
+    sendText: async (destHex, text) => mesh.sendText(destHex, text, {}),
+    log: { log: () => {}, error: () => {} },
+    apiKey: "key",
+    fetchImpl: /** @type {any} */ (
+      async () => ({
+        ok: true,
+        json: async () => ({
+          code: 200,
+          data: {
+            limits: [
+              {
+                type: "TOKENS_LIMIT",
+                unit: 3,
+                percentage: 100,
+                nextResetTime: 0,
+              },
+            ],
+            level: "pro",
+          },
+        }),
+      })
+    ),
+    now: () => Date.UTC(2026, 8, 28, 12, 0, 0),
+    pollIntervalMs: 5,
+  });
+  const bridge = new Bridge({
+    config: /** @type {any} */ ({
+      midRunBehavior: "steer",
+      chunkChars: 2500,
+      name: "test-node",
+      owner: OWNER,
+    }),
+    rpc: /** @type {any} */ (rpc),
+    mesh,
+    state,
+    quotaWatcher: watcher,
+    log: { log: () => {}, error: () => {} },
+    onShutdown: () => {},
+  });
+  bridge.start();
+  bridge.setRpcReady(true);
+
+  // Active model is cortecs: watcher stays disabled, errors do nothing.
+  rpc.states.push({ model: { provider: "cortecs", id: "claude-opus-5.5" } });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "work" });
+  await bridge.queue;
+  await sleep(5);
+  assert.equal(watcher.enabled, false, "watcher disabled for cortecs model");
+  rpc.emitEvent({ type: "agent_start" });
+  rpc.emitEvent({
+    type: "auto_retry_end",
+    success: false,
+    finalError: "403 quota exceeded",
+  });
+  await sleep(15);
+  assert.equal(mesh.sent.length, 0, "no notification for non-zai model");
+  watcher.stop();
 });

@@ -268,6 +268,32 @@ answered with `{"type":"extension_ui_response","id":…,"cancelled":true}`
 and the owner is informed: `⛔ dialog dismissed: <title>`. Fire-and-forget
 UI methods (`notify`, `setStatus`, `setWidget`, …) are ignored.
 
+### 6.5 z.ai GLM quota watcher and peak-hours warning
+
+When the active model is a z.ai GLM model (`provider === "zai"`), the bridge
+runs a `GlmQuotaWatcher` (`src/quota.js`) that does two things, both gated
+on the active model being GLM — nothing fires for non-z.ai providers (e.g.
+Cortecs, Anthropic):
+
+- **Quota-recovery notification.** When a run fails with a z.ai
+  quota-exhausted error (matched from `auto_retry_end`/`compaction_end`
+  error messages), the watcher polls the same z.ai quota endpoint
+  `pi-glm-usage` uses (`https://api.z.ai/api/monitor/usage/quota/limit`,
+  Bearer `~/.pi/agent/auth.json` → `zai.key`, honouring `PI_AUTH_DIR`) every
+  60s and delivers **exactly one** LXMF message to the owner the moment
+  the 5h bucket drops below 100%. One notification per exhausted episode;
+  rate-limit-only errors (transient, retried by Pi) do not arm it. A
+  missing `zai.key` disables the watcher gracefully (logged once).
+- **Peak-hours warning.** z.ai charges 3× tokens Mon–Fri 14:00–18:00
+  Singapore Standard Time (UTC+8). The owner is warned when an
+  owner-triggered run starts inside that window, and when the window
+  opens mid-run, so they can decide whether to stop or continue. The
+  internal empty-reply recovery run is never warned.
+
+Notifications and warnings go to the configured `owner`; under future
+DACAR per-subtree identity ACLs (§13) the "who to notify" decision stays
+in one place so it can be retargeted per subtree.
+
 ## 7. Chat command reference
 
 | Owner sends | Action | LLM turn |

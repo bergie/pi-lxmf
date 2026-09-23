@@ -15,7 +15,9 @@ import {
   readSessionPointer,
   writeSessionPointer,
 } from "./config.js";
+import { deriveLxmfDestinationHash } from "./identity.js";
 import { startLxmf } from "./lxmf.js";
+import { GlmQuotaWatcher, readZaiKey } from "./quota.js";
 import { PiRpcClient } from "./rpc.js";
 
 const USAGE = `pi-lxmf — drive Pi over LXMF messaging
@@ -182,6 +184,13 @@ async function main() {
       loadSession: () => readSessionPointer(config.dataDir),
       saveSession: (file) => writeSessionPointer(config.dataDir, file),
     },
+    quotaWatcher: new GlmQuotaWatcher({
+      ownerDestinationHash: deriveLxmfDestinationHash(config.owner),
+      sendText: (destHex, text) =>
+        mesh.sendText(destHex, text, { title: config.name }),
+      log: console,
+      apiKey: readZaiKey(),
+    }),
     onShutdown: shutdown,
   });
   bridge.start();

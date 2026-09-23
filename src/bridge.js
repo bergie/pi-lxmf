@@ -19,6 +19,7 @@ import {
   parseCommand,
 } from "./commands.js";
 import { deriveLxmfDestinationHash } from "./identity.js";
+import { isZaiModel } from "./quota.js";
 import { assistantText } from "./rpc.js";
 import { errorText } from "./text.js";
 
@@ -80,6 +81,7 @@ export class Bridge {
    * @param {import("./rpc.js").PiRpcClient} options.rpc
    * @param {MeshAdapter} options.mesh
    * @param {BridgeState} options.state
+   * @param {import("./quota.js").GlmQuotaWatcher} [options.quotaWatcher] - z.ai quota/peak watcher; enabled when the active model is a GLM model.
    * @param {Logger} [options.log] - Diagnostic sink.
    * @param {(reason: string) => void} [options.onShutdown] - Called when the bridge wants the daemon to exit.
    */
@@ -88,6 +90,7 @@ export class Bridge {
     this.rpc = options.rpc;
     this.mesh = options.mesh;
     this.state = options.state;
+    this.quotaWatcher = options.quotaWatcher || null;
     this.log = options.log || console;
     this.onShutdown = options.onShutdown || (() => {});
 
@@ -121,6 +124,9 @@ export class Bridge {
     this.lastError = null;
     /** @type {string|null} */
     this.failedNote = null;
+    /** The most recently observed active model (gates the GLM quota watcher). */
+    /** @type {any} */
+    this.activeModel = null;
 
     this.startedAt = Date.now();
     /** @type {Promise<void>} */
@@ -382,9 +388,11 @@ export class Bridge {
       case "agent_start":
         this.busy = true;
         this.scheduleReaction();
+        if (this.quotaWatcher) this.quotaWatcher.onAgentStart(!this.recovering);
         break;
       case "agent_settled":
         this.busy = false;
+        if (this.quotaWatcher) this.quotaWatcher.onAgentSettled();
         void this.onSettled();
         break;
       case "message_end": {
@@ -401,11 +409,14 @@ export class Bridge {
       case "auto_retry_end":
         if (event.success === false && event.finalError) {
           this.lastError = String(event.finalError);
+          if (this.quotaWatcher)
+            this.quotaWatcher.onError(String(event.finalError));
         }
         break;
       case "compaction_end":
         if (!event.aborted && !event.result && event.errorMessage) {
           this.lastError = `compaction failed: ${event.errorMessage}`;
+          if (this.quotaWatcher) this.quotaWatcher.onError(event.errorMessage);
         }
         break;
       case "extension_ui_request": {
@@ -492,6 +503,12 @@ export class Bridge {
       }
       this.rpc.setSessionPath(file);
     }
+    // Track the active model (gates the GLM quota watcher when present).
+    if (state.model !== undefined) {
+      this.activeModel = state.model ?? null;
+      if (this.quotaWatcher)
+        this.quotaWatcher.setEnabled(isZaiModel(this.activeModel));
+    }
   }
 
   /**
@@ -543,6 +560,7 @@ export class Bridge {
   requestShutdown(reason) {
     if (this.shutdownRequested) return;
     this.clearReaction();
+    if (this.quotaWatcher) this.quotaWatcher.stop();
     this.shutdownRequested = true;
     this.log.log(`pi-lxmf: shutdown requested (${reason})`);
     this.onShutdown(reason);
