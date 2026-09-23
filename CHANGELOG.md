@@ -28,3 +28,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - End-to-end smoketest (`scripts/smoke.mjs` + `scripts/fake-pi.mjs`): runs
     the real daemon against a fake `pi --mode rpc` and a second in-process
     LXMF owner over a local rnsd shared instance.
+- GitHub Actions CI: tests (with lint and type checks) on every push, and
+  OIDC-based npm publishing on tag pushes (no registry token stored).
