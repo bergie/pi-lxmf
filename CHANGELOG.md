@@ -52,5 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     link is frequently gone by reply time. The same `LXMessage` object is
     re-sent so every wire copy shares one message id and a deduplicating
     client (Sideband, NomadNet) renders the reply once.
+  - Run-start acknowledgement via LXMF reaction: when a run starts and no
+    reply lands within a 2 s debounce window, the bridge sends a 🤔
+    reaction (LXMF `FIELD_REACTION`, §5.9.8) targeting the message that
+    triggered the run, so the owner sees their message acknowledged while
+    the agent works. A fast run whose reply beats the window sends no
+    extra message. The reaction is carried solely by the reaction field
+    (Sideband/NomadNet render it natively; no separate chat bubble is
+    emitted alongside it). The internal empty-reply recovery run is never
+    acknowledged. Added
+    `sendReaction(destinationHex, targetMessageId, emoji, opts)` to the
+    mesh adapter (`src/lxmf.js`), reusing the same retry path as
+    `sendText`.
 - GitHub Actions CI: tests (with lint and type checks) on every push, and
   OIDC-based npm publishing on tag pushes (no registry token stored).

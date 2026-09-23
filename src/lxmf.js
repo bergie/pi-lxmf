@@ -12,7 +12,7 @@
 
 import { join } from "node:path";
 import { fromHex, Identity, Reticulum, toHex } from "@reticulum/core";
-import { LXMessage, LXMRouter } from "@reticulum/lxmf";
+import { LXMessage, LXMFConstants, LXMRouter } from "@reticulum/lxmf";
 import {
   AutoInterface,
   FileStorageAdapter,
@@ -116,6 +116,7 @@ export function attachInboundDiagnostics(lxmf, log = () => {}) {
  *   deliveryHash: string,
  *   interfaceNames: string[],
  *   sendText: (destinationHex: string, text: string, options?: {link?: any, title?: string}) => Promise<void>,
+ *   sendReaction: (destinationHex: string, targetMessageId: Uint8Array, emoji: string, options?: {link?: any}) => Promise<void>,
  *   stop: () => void
  * }>}
  */
@@ -260,6 +261,42 @@ export async function startLxmf(config, options = {}) {
   }
 
   /**
+   * Sends an LXMF reaction (FIELD_REACTION, §5.9.8) to `destinationHex`,
+   * targeting the message whose `messageId` is `targetMessageId`. The
+   * reaction field is rendered natively by Sideband/NomadNet (confirmed in
+   * live testing); no `content` is set so no separate chat bubble is
+   * produced alongside the reaction. Reuses `sendWithRetry` for the same
+   * retry-once path as `sendText` (same message object across retries → one
+   * message id).
+   *
+   * @param {string} destinationHex
+   * @param {Uint8Array} targetMessageId - The `message_id` of the message being reacted to.
+   * @param {string} emoji
+   * @param {{link?: any}} [sendOptions]
+   */
+  async function sendReaction(
+    destinationHex,
+    targetMessageId,
+    emoji,
+    sendOptions = {},
+  ) {
+    const reaction = new Map();
+    reaction.set(LXMFConstants.REACTION_TO, targetMessageId);
+    reaction.set(
+      LXMFConstants.REACTION_CONTENT,
+      new TextEncoder().encode(emoji),
+    );
+    const fields = new Map();
+    fields.set(LXMFConstants.FIELD_REACTION, reaction);
+    const message = new LXMessage({
+      sourceHash: /** @type {Uint8Array} */ (deliveryDest.destinationHash),
+      destinationHash: fromHex(destinationHex),
+      fields,
+    });
+    await sendWithRetry(message, sendOptions.link);
+  }
+
+  /**
    * @param {LXMessage} message
    * @param {any} [link]
    */
@@ -294,6 +331,7 @@ export async function startLxmf(config, options = {}) {
     deliveryHash,
     interfaceNames,
     sendText,
+    sendReaction,
     stop() {
       detachDiagnostics();
       lxmf.stopAnnouncing();

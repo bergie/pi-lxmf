@@ -172,6 +172,8 @@ class FakeMesh {
     this.target = new EventTarget();
     /** @type {Array<{destinationHex: string, text: string, options: any}>} */
     this.sent = [];
+    /** @type {Array<{destinationHex: string, targetMessageId: Uint8Array, emoji: string, options: any}>} */
+    this.reactions = [];
     this.identityHash = "1".repeat(32);
     this.deliveryHash = "2".repeat(32);
   }
@@ -190,7 +192,17 @@ class FakeMesh {
   }
 
   /**
-   * @param {{sourceHash: string, content: string, title?: string, link?: any}} message
+   * @param {string} destinationHex
+   * @param {Uint8Array} targetMessageId
+   * @param {string} emoji
+   * @param {{link?: any}} [options]
+   */
+  async sendReaction(destinationHex, targetMessageId, emoji, options = {}) {
+    this.reactions.push({ destinationHex, targetMessageId, emoji, options });
+  }
+
+  /**
+   * @param {{sourceHash: string, content: string, title?: string, link?: any, messageId?: Uint8Array}} message
    */
   emitMessage(message) {
     this.target.dispatchEvent(
@@ -643,4 +655,106 @@ test("messages arriving before readiness queue up", async () => {
   bridge.setRpcReady(true);
   await bridge.queue;
   assert.equal(rpc.prompts.length, 1);
+});
+
+test("reaction acknowledges a slow run, targeting the triggering message", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  bridge.reactionDebounceMs = 10;
+  const triggerId = new Uint8Array(32).fill(9);
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "long task",
+    link: LINK,
+    messageId: triggerId,
+  });
+  await bridge.queue;
+
+  // Run starts but no reply arrives within the (short) debounce window.
+  rpc.emitEvent({ type: "agent_start" });
+  await sleep(30);
+  assert.equal(mesh.reactions.length, 1);
+  assert.equal(mesh.reactions[0].destinationHex, OWNER_DEST);
+  assert.equal(mesh.reactions[0].emoji, "🤔");
+  assert.equal(mesh.reactions[0].options.link, LINK);
+  assert.deepEqual(mesh.reactions[0].targetMessageId, triggerId);
+  // No chat reply yet.
+  assert.equal(mesh.sent.length, 0);
+
+  // The real reply lands later and is delivered normally.
+  rpc.emitEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "finally done" }],
+    },
+  });
+  rpc.emitEvent({ type: "agent_settled" });
+  await sleep(10);
+  assert.deepEqual(
+    mesh.sent.map((s) => s.text),
+    ["finally done"],
+  );
+  // Still only the one reaction.
+  assert.equal(mesh.reactions.length, 1);
+});
+
+test("reaction is skipped when a reply beats the debounce", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  bridge.reactionDebounceMs = 200;
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "quick task",
+    messageId: new Uint8Array(32).fill(9),
+  });
+  await bridge.queue;
+
+  rpc.emitEvent({ type: "agent_start" });
+  // A reply lands before the window elapses.
+  rpc.emitEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "fast reply" }],
+    },
+  });
+  rpc.emitEvent({ type: "agent_settled" });
+  await sleep(30);
+  assert.equal(mesh.reactions.length, 0);
+  assert.deepEqual(
+    mesh.sent.map((s) => s.text),
+    ["fast reply"],
+  );
+});
+
+test("reaction is not sent for the empty-reply recovery run", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  bridge.reactionDebounceMs = 10;
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "silent task",
+    messageId: new Uint8Array(32).fill(9),
+  });
+  await bridge.queue;
+
+  // First run starts and stays open past the debounce: one reaction fires.
+  rpc.emitEvent({ type: "agent_start" });
+  await sleep(30);
+  assert.equal(mesh.reactions.length, 1);
+
+  // It then settles empty; recovery kicks in. The recovery run's
+  // agent_start must not schedule another reaction.
+  rpc.emitEvent({ type: "agent_settled" });
+  await sleep(30);
+  assert.equal(mesh.reactions.length, 1);
+  assert.equal(rpc.prompts.length, 2);
+});
+
+test("reaction is not sent when the trigger has no messageId", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  bridge.reactionDebounceMs = 10;
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "no id" });
+  await bridge.queue;
+  rpc.emitEvent({ type: "agent_start" });
+  await sleep(30);
+  assert.equal(mesh.reactions.length, 0);
 });

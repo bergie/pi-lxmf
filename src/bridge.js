@@ -25,6 +25,11 @@ import { errorText } from "./text.js";
 /** Extension-UI methods that expect a response (dialogs to decline). */
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
+/** Emoji sent as a run-start acknowledgement when no reply lands fast. */
+const REACTION_EMOJI = "🤔";
+/** How long after `agent_start` to wait for a reply before acknowledging. */
+const REACTION_DEBOUNCE_MS = 2000;
+
 /**
  * Diagnostic sink satisfied by `console`.
  *
@@ -48,6 +53,7 @@ const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
  * @typedef {object} MeshAdapter
  * @property {EventTarget} lxmf - The LXMRouter (dispatches "message" events).
  * @property {(destHex: string, text: string, opts?: {link?: any, title?: string}) => Promise<void>} sendText
+ * @property {(destHex: string, targetMessageId: Uint8Array, emoji: string, opts?: {link?: any}) => Promise<void>} sendReaction
  * @property {string} identityHash
  * @property {string} deliveryHash
  */
@@ -94,6 +100,13 @@ export class Bridge {
     this.lastSessionFile = null;
     /** @type {any} */
     this.lastLink = undefined;
+    /** The `message_id` of the message that opened the current exchange, kept for the run-start reaction. */
+    /** @type {Uint8Array|null} */
+    this.lastTriggerMessageId = null;
+    /** @type {NodeJS.Timeout|null} */
+    this.reactionTimer = null;
+    this.reactionPending = false;
+    this.reactionDebounceMs = REACTION_DEBOUNCE_MS;
 
     this.rpcReady = false;
     /** @type {{promise: Promise<void>, resolve: () => void}|null} */
@@ -214,6 +227,7 @@ export class Bridge {
       return;
     }
     this.lastLink = link ?? this.lastLink;
+    this.lastTriggerMessageId = message.messageId ?? null;
 
     // Serialize all inbound handling so prompts and commands keep order.
     const run = this.queue
@@ -335,6 +349,7 @@ export class Bridge {
     switch (event.type) {
       case "agent_start":
         this.busy = true;
+        this.scheduleReaction();
         break;
       case "agent_settled":
         this.busy = false;
@@ -344,6 +359,8 @@ export class Bridge {
         if (event.message?.role !== "assistant") break;
         const text = assistantText(event.message);
         if (text && this.exchangeActive) {
+          // A real reply landed: no need for the run-start acknowledgement.
+          this.clearReaction();
           this.sentThisExchange += 1;
           void this.deliver(text);
         }
@@ -379,6 +396,9 @@ export class Bridge {
    * got no reply at all for it.
    */
   async onSettled() {
+    // The run is over — any pending run-start acknowledgement is moot
+    // (and recovery, which follows, is never acknowledged itself).
+    this.clearReaction();
     if (!this.exchangeActive) return;
     const sent = this.sentThisExchange;
     this.exchangeActive = false;
@@ -490,8 +510,63 @@ export class Bridge {
    */
   requestShutdown(reason) {
     if (this.shutdownRequested) return;
+    this.clearReaction();
     this.shutdownRequested = true;
     this.log.log(`pi-lxmf: shutdown requested (${reason})`);
     this.onShutdown(reason);
+  }
+
+  /**
+   * Schedules a best-effort LXMF reaction to the message that opened the
+   * current exchange, acknowledging "a run started" when no reply lands
+   * within the debounce window (so fast runs don't get an extra message
+   * ahead of the real answer). Skipped for the internal empty-reply
+   * recovery run, which is not an owner-triggered exchange (see `onSettled`).
+   */
+  scheduleReaction() {
+    this.clearReaction();
+    if (this.recovering) return; // recovery run — not owner-triggered
+    const target = this.lastTriggerMessageId;
+    if (!target) return; // nothing to react to (e.g. command-triggered)
+    this.reactionPending = true;
+    this.reactionTimer = setTimeout(() => {
+      this.reactionTimer = null;
+      if (!this.reactionPending) return;
+      this.reactionPending = false;
+      void this.sendReaction(target);
+    }, this.reactionDebounceMs);
+    if (typeof this.reactionTimer.unref === "function") {
+      this.reactionTimer.unref();
+    }
+  }
+
+  /**
+   * Cancels any pending run-start reaction. Idempotent.
+   */
+  clearReaction() {
+    if (this.reactionTimer) {
+      clearTimeout(this.reactionTimer);
+      this.reactionTimer = null;
+    }
+    this.reactionPending = false;
+  }
+
+  /**
+   * Sends the run-start acknowledgement reaction to the owner. Best-effort:
+   * a failure is logged but never blocks the exchange (it's not a reply).
+   *
+   * @param {Uint8Array} targetMessageId
+   */
+  async sendReaction(targetMessageId) {
+    try {
+      await this.mesh.sendReaction(
+        this.ownerDestinationHash,
+        targetMessageId,
+        REACTION_EMOJI,
+        { link: this.lastLink },
+      );
+    } catch (e) {
+      this.log.error(`pi-lxmf: reaction send failed: ${errorText(e)}`);
+    }
   }
 }
