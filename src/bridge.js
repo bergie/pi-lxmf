@@ -18,6 +18,7 @@ import {
   EMPTY_REPLY_RECOVERY_PROMPT,
   parseCommand,
 } from "./commands.js";
+import { deriveLxmfDestinationHash } from "./identity.js";
 import { assistantText } from "./rpc.js";
 import { errorText } from "./text.js";
 
@@ -33,11 +34,9 @@ const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
  */
 
 /**
- * Machine-managed state persistence (owner pairing, session pointer).
+ * Machine-managed state persistence (session pointer).
  *
  * @typedef {object} BridgeState
- * @property {() => string|null} loadOwner
- * @property {(hash: string) => void} saveOwner
  * @property {() => {sessionFile: string}|null} loadSession
  * @property {(file: string) => void} saveSession
  */
@@ -85,8 +84,10 @@ export class Bridge {
     this.log = options.log || console;
     this.onShutdown = options.onShutdown || (() => {});
 
-    /** @type {string|null} */
-    this.owner = options.config.owner ?? null;
+    /** The owner's Reticulum identity hash (protocol-agnostic, from config). */
+    this.ownerIdentity = options.config.owner;
+    /** The owner's derived lxmf.delivery destination hash (wire form). */
+    this.ownerDestinationHash = deriveLxmfDestinationHash(options.config.owner);
     /** @type {string|null} */
     this.sessionName = null;
     /** @type {string|null} */
@@ -120,13 +121,6 @@ export class Bridge {
   start() {
     if (this.subscribed) return;
     this.subscribed = true;
-
-    if (!this.owner) {
-      this.owner = this.state.loadOwner();
-      if (this.owner) {
-        this.log.log(`pi-lxmf: loaded paired owner ${this.owner}`);
-      }
-    }
 
     this.mesh.lxmf.addEventListener("message", (/** @type {any} */ event) => {
       void this.onLxmfMessage(event);
@@ -202,26 +196,15 @@ export class Bridge {
     const message = event.detail?.message;
     const link = event.detail?.link;
     if (!message?.sourceHash) return;
+    // The LXMF source_hash is the sender's lxmf.delivery DESTINATION hash —
+    // the wire form compared against the owner's derived destination hash.
     const sourceHex = toHexString(message.sourceHash);
 
-    if (this.owner && sourceHex !== this.owner) {
+    if (sourceHex !== this.ownerDestinationHash) {
       this.log.log(
-        `pi-lxmf: dropped message from unpaired source ${sourceHex}`,
+        `pi-lxmf: dropped message from unauthorized source ${sourceHex}`,
       );
       return;
-    }
-    if (!this.owner) {
-      this.owner = sourceHex;
-      try {
-        this.state.saveOwner(sourceHex);
-      } catch (e) {
-        this.log.error(`pi-lxmf: could not persist owner pairing: ${e}`);
-      }
-      this.log.log(`pi-lxmf: paired owner ${sourceHex}`);
-      await this.deliver(
-        `Paired: this Pi node is now driven by ${sourceHex}.\n` +
-          "Send /help for the available commands.",
-      );
     }
 
     const content =
@@ -461,7 +444,7 @@ export class Bridge {
       getBridgeInfo: () => ({
         identityHash: this.mesh.identityHash,
         deliveryHash: this.mesh.deliveryHash,
-        owner: this.owner,
+        owner: this.ownerIdentity,
         uptimeMs: Date.now() - this.startedAt,
       }),
     };
@@ -481,10 +464,9 @@ export class Bridge {
    * @param {string} text
    */
   async deliver(text) {
-    if (!this.owner) return;
     const payload = this.failedNote ? `${this.failedNote}\n\n${text}` : text;
     try {
-      await this.mesh.sendText(this.owner, payload, {
+      await this.mesh.sendText(this.ownerDestinationHash, payload, {
         link: this.lastLink,
         title: this.replyTitle(),
       });

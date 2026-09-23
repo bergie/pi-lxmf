@@ -8,9 +8,14 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
 import { Bridge } from "../src/bridge.js";
+import { deriveLxmfDestinationHash } from "../src/identity.js";
 
+// The owner is configured by Reticulum IDENTITY hash; the wire carries the
+// derived lxmf.delivery destination hashes.
 const OWNER = "aa11223344556677889900aabbccddeeff".slice(0, 32);
 const STRANGER = "bb11223344556677889900aabbccddeeff".slice(0, 32);
+const OWNER_DEST = deriveLxmfDestinationHash(OWNER);
+const STRANGER_DEST = deriveLxmfDestinationHash(STRANGER);
 const LINK = new Uint8Array([1, 2, 3, 4]);
 
 /**
@@ -233,7 +238,7 @@ class FakeState {
 /**
  * @param {object} [options]
  * @param {any} [options.config]
- * @param {string|null} [options.owner]
+ * @param {string} [options.owner]
  * @param {Function} [options.onShutdown]
  */
 function makeBridge(options = {}) {
@@ -247,7 +252,7 @@ function makeBridge(options = {}) {
       midRunBehavior: "steer",
       chunkChars: 2500,
       name: "test-node",
-      owner: options.owner ?? null,
+      owner: options.owner ?? OWNER,
       ...options.config,
     },
     rpc: /** @type {any} */ (rpc),
@@ -263,7 +268,11 @@ function makeBridge(options = {}) {
 
 test("inbound from owner becomes a prompt; reply delivered on settle", async () => {
   const { bridge, rpc, mesh, state } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "do the thing", link: LINK });
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "do the thing",
+    link: LINK,
+  });
   await bridge.queue;
 
   assert.deepEqual(rpc.prompts, [
@@ -283,7 +292,7 @@ test("inbound from owner becomes a prompt; reply delivered on settle", async () 
 
   assert.equal(mesh.sent.length, 1);
   assert.equal(mesh.sent[0].text, "did it");
-  assert.equal(mesh.sent[0].destinationHex, OWNER);
+  assert.equal(mesh.sent[0].destinationHex, OWNER_DEST);
   assert.equal(mesh.sent[0].options.link, LINK);
   assert.equal(mesh.sent[0].options.title, "test-node");
 });
@@ -291,7 +300,7 @@ test("inbound from owner becomes a prompt; reply delivered on settle", async () 
 test("mid-run prompts steer (authoritative isStreaming)", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
   rpc.states.push({ isStreaming: true });
-  mesh.emitMessage({ sourceHash: OWNER, content: "change of plans" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "change of plans" });
   await bridge.queue;
   assert.deepEqual(rpc.prompts, [
     { message: "change of plans", streamingBehavior: "steer" },
@@ -305,7 +314,7 @@ test("steer race: rejected idle prompt is retried queued", async () => {
     success: false,
     error: "Agent is streaming: specify streamingBehavior",
   });
-  mesh.emitMessage({ sourceHash: OWNER, content: "while busy" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "while busy" });
   await bridge.queue;
   assert.deepEqual(rpc.prompts, [
     { message: "while busy", streamingBehavior: undefined },
@@ -315,33 +324,16 @@ test("steer race: rejected idle prompt is retried queued", async () => {
 
 test("non-owner messages are dropped silently", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: STRANGER, content: "let me in" });
+  mesh.emitMessage({ sourceHash: STRANGER_DEST, content: "let me in" });
   await bridge.queue;
   await sleep(10);
   assert.equal(rpc.prompts.length, 0);
   assert.equal(mesh.sent.length, 0);
 });
 
-test("first contact pairs the sender and still processes the message", async () => {
-  const { bridge, rpc, mesh, state } = makeBridge();
-  mesh.emitMessage({ sourceHash: STRANGER, content: "hello there" });
-  await bridge.queue;
-  await sleep(10);
-
-  assert.equal(state.owner, STRANGER);
-  assert.equal(mesh.sent.length, 1);
-  assert.match(mesh.sent[0].text, /Paired: this Pi node is now driven by/);
-  assert.equal(rpc.prompts.length, 1);
-
-  // The paired owner can now drive; the previous owner hash is refused.
-  mesh.emitMessage({ sourceHash: OWNER, content: "me too" });
-  await bridge.queue;
-  assert.equal(rpc.prompts.length, 1);
-});
-
 test("empty-tail recovery asks once, then nudges", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "hard task" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "hard task" });
   await bridge.queue;
 
   // Run settles with no assistant text at all.
@@ -363,7 +355,7 @@ test("empty-tail recovery asks once, then nudges", async () => {
 
 test("recovery reply is delivered normally", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "task" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "task" });
   await bridge.queue;
   rpc.emitEvent({ type: "agent_start" });
   rpc.emitEvent({ type: "agent_settled" });
@@ -387,7 +379,7 @@ test("recovery reply is delivered normally", async () => {
 
 test("failed runs report the error instead of recovering", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "task" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "task" });
   await bridge.queue;
   rpc.emitEvent({ type: "agent_start" });
   rpc.emitEvent({
@@ -404,7 +396,10 @@ test("failed runs report the error instead of recovering", async () => {
 
 test("every assistant text in an exchange is delivered", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "two-part answer please" });
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "two-part answer please",
+  });
   await bridge.queue;
   rpc.emitEvent({ type: "agent_start" });
   rpc.emitEvent({
@@ -455,42 +450,42 @@ test("extension dialogs are declined and reported", async () => {
 test("chat commands run without an LLM turn", async () => {
   const { bridge, rpc, mesh, shutdowns } = makeBridge({ owner: OWNER });
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/new" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/new" });
   await bridge.queue;
   assert.ok(rpc.calls.some((c) => c[0] === "new_session"));
   assert.equal(rpc.prompts.length, 0);
   assert.match(lastSent(mesh), /New session started/);
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "!" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "!" });
   await bridge.queue;
   assert.ok(rpc.calls.some((c) => c[0] === "abort"));
   assert.equal(rpc.calls.filter((c) => c[0] === "clear_queue").length, 0);
   assert.match(lastSent(mesh), /aborted \(queue intact\)/);
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/abort" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/abort" });
   await bridge.queue;
   assert.ok(rpc.calls.some((c) => c[0] === "clear_queue"));
   assert.match(lastSent(mesh), /Aborted\. Dropped 1 queued message/);
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/model gpt" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/model gpt" });
   await bridge.queue;
   assert.ok(
     rpc.calls.some((c) => c[0] === "set_model" && c[1] === "openai/gpt-5.2"),
   );
   assert.match(lastSent(mesh), /Model set to openai\/gpt-5\.2/);
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/think high" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/think high" });
   await bridge.queue;
   assert.ok(
     rpc.calls.some((c) => c[0] === "set_thinking_level" && c[1] === "high"),
   );
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/help" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/help" });
   await bridge.queue;
   assert.match(lastSent(mesh), /\/skill:review — Review code/);
   assert.match(lastSent(mesh), /! \(bare\) — quick interrupt/);
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "/quit" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/quit" });
   await bridge.queue;
   await sleep(10);
   assert.match(lastSent(mesh), /Shutting down/);
@@ -501,7 +496,7 @@ test("chat commands run without an LLM turn", async () => {
 
 test("unknown slash commands pass through as prompts", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
-  mesh.emitMessage({ sourceHash: OWNER, content: "/skill:review src/" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/skill:review src/" });
   await bridge.queue;
   assert.deepEqual(rpc.prompts, [
     { message: "/skill:review src/", streamingBehavior: undefined },
@@ -513,7 +508,7 @@ test("command failures are reported, not thrown", async () => {
   rpc.getState = async () => {
     throw new Error("state unavailable");
   };
-  mesh.emitMessage({ sourceHash: OWNER, content: "/status" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/status" });
   await bridge.queue;
   assert.match(lastSent(mesh), /\/status failed: state unavailable/);
 });
@@ -530,7 +525,7 @@ test("failed LXMF delivery is noted on the next message", async () => {
     return realSend(destinationHex, text, options);
   };
 
-  mesh.emitMessage({ sourceHash: OWNER, content: "task one" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "task one" });
   await bridge.queue;
   rpc.emitEvent({ type: "agent_start" });
   rpc.emitEvent({
@@ -545,7 +540,7 @@ test("failed LXMF delivery is noted on the next message", async () => {
   assert.equal(mesh.sent.length, 0); // delivery failed, noted
 
   // The next exchange delivers with the failure note prepended.
-  mesh.emitMessage({ sourceHash: OWNER, content: "task two" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "task two" });
   await bridge.queue;
   rpc.emitEvent({ type: "agent_start" });
   rpc.emitEvent({
@@ -580,7 +575,7 @@ test("events arriving in the same chunk as the prompt response are not lost", as
     rpc.emitEvent({ type: "agent_settled" });
     return { success: true };
   };
-  mesh.emitMessage({ sourceHash: OWNER, content: "race me" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "race me" });
   await bridge.queue;
   await sleep(10);
   assert.deepEqual(
@@ -613,7 +608,7 @@ test("same-chunk empty run triggers recovery and delivers its reply", async () =
     }
     return { success: true };
   };
-  mesh.emitMessage({ sourceHash: OWNER, content: "silent run" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "silent run" });
   await bridge.queue;
   await sleep(10);
   assert.equal(rpc.prompts.length, 2);
@@ -627,7 +622,7 @@ test("same-chunk empty run triggers recovery and delivers its reply", async () =
 test("prompt rejected after optimistic open closes the exchange", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
   rpc.promptResponses.push({ success: false, error: "no such model" });
-  mesh.emitMessage({ sourceHash: OWNER, content: "anything" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "anything" });
   await bridge.queue;
   await sleep(10);
   assert.match(mesh.sent.at(-1)?.text ?? "", /prompt rejected: no such model/);
@@ -642,7 +637,7 @@ test("prompt rejected after optimistic open closes the exchange", async () => {
 test("messages arriving before readiness queue up", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
   bridge.setRpcReady(false);
-  mesh.emitMessage({ sourceHash: OWNER, content: "early bird" });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "early bird" });
   await sleep(20);
   assert.equal(rpc.prompts.length, 0);
   bridge.setRpcReady(true);

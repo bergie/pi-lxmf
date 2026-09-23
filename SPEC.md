@@ -19,8 +19,9 @@ running one daemon.
 
 Objectives, in priority order:
 
-1. **Single owner, full control.** One paired LXMF identity (the *owner*)
-   drives the agent; everyone else is ignored. Plain text is a prompt,
+1. **Single owner, full control.** One configured owner — identified by
+   their Reticulum identity hash — drives the agent; everyone else is
+   ignored. Plain text is a prompt,
    slash commands map to Pi controls, and replies always reach the owner.
 2. **Robust asynchronous operation.** LXMF is store-and-forward and mesh
    transport is slow and lossy; the bridge never assumes a fast round trip.
@@ -42,7 +43,7 @@ and acting as an LXMF propagation node. These are covered in §13.
 | Reference | What is taken from it |
 |---|---|
 | [pi-msg](https://github.com/zachpmanson/pi-msg) | Overall architecture: a bridge daemon spawns `pi --mode rpc` and translates between chat and Pi's JSONL RPC protocol. Command surface (`/new`, `/abort` vs `!`, `/model`, `/session`, …), session persistence across restarts, empty-tail reply recovery, auto-dismissing extension dialogs. |
-| [@llblab/pi-telegram](https://pi.dev/packages/@llblab/pi-telegram) | The JS/Pi-package conventions studied for this spec: config under the agent/home directory, first-contact owner pairing, queue-instead-of-interrupt handling of messages that arrive mid-run. |
+| [@llblab/pi-telegram](https://pi.dev/packages/@llblab/pi-telegram) | The JS/Pi-package conventions studied for this spec: config under the agent/home directory, queue-instead-of-interrupt handling of messages that arrive mid-run. (Its first-contact pairing was deliberately *not* adopted — see §6.1.) |
 | `reticulum-js` (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/node`) | The entire LXMF transport: `LXMRouter`, `LXMessage`, interface setup (shared instance → AutoInterface → TCP fallback), announce app-data conventions, identity persistence. See `../reticulum-js/examples/lxmf_echobot.js` and `lxmf_sender.js` for the canonical wiring. |
 | `pi-rngit-work-document-skill` | Project conventions: ESM + JSDoc, Biome with `--use-editorconfig=true`, `node --test`, EUPL-1.2, `@reticulum/*` dependency set, `createBz2()` adapter for Resource compression. |
 | Pi RPC protocol (`docs/rpc.md` of `@earendil-works/pi-coding-agent`) | The exact command/event vocabulary used below. |
@@ -64,7 +65,7 @@ Two processes, deliberately:
 
 - **The bridge daemon** (`pi-lxmf` bin) owns everything long-lived and
   precious: the Reticulum identity (the node's LXMF address), the mesh
-  interfaces, the announce loop, the pairing state, and the session pointer.
+  interfaces, the announce loop, and the session pointer.
   It must survive Pi crashes and Pi upgrades without changing identity.
 - **`pi --mode rpc`** is a child process, disposable and restartable. All
   agent control flows through its documented RPC protocol (JSON commands on
@@ -154,8 +155,9 @@ example:
    (`detail.message`) and the link id (`detail.link`). The router already
    deduplicates by LXMF message id within a process lifetime.
 7. **Sending.** Replies are `LXMessage`s from our `deliveryDest` to the
-   owner's source hash, sent with `lxmf.send(reply, identity, link)` —
-   reusing the inbound link when one exists. The router handles direct-link
+   owner's LXMF address (their `lxmf.delivery` destination hash), sent with
+   `lxmf.send(reply, identity, link)` — reusing the inbound link when one
+   exists. The router handles direct-link
    delivery (Resources for bodies over the link MDU) and falls back to
    opportunistic delivery when no link can be established.
 8. **Propagation (optional).** When `propagationNode` is configured (an
@@ -183,13 +185,23 @@ serialized through a single promise chain so prompts keep their order.
 
 ### 6.1 Owner model
 
-- If `owner` is configured (32-hex source hash), messages from any other
-  source hash are dropped (logged at debug). No reply is sent to
-  non-owners — the bridge must not acknowledge its existence to strangers.
-- If `owner` is unset, the **first** sender to arrive is paired: their
-  source hash is persisted to `<dataDir>/owner` and confirmed with a reply.
-  This is a first-contact boundary exactly like pi-telegram's `/start`
-  pairing; operators who care should preconfigure `owner` (see §11).
+- The controlling owner is **configured, never learned**: the required
+  `owner` config field holds their **Reticulum identity hash** (32 hex) —
+  the protocol-agnostic identifier of their Ed25519 identity, not the
+  `lxmf.delivery` destination hash ("LXMF Address") the wire carries. The
+  identity → destination-hash derivation (`src/identity.js`, proven against
+  `Destination.IN` in tests) expands it to the wire form, and inbound
+  messages whose LXMF source hash differs are dropped (logged at debug). No
+  reply is sent to non-owners — the bridge must not acknowledge its existence
+  to strangers.
+- Rationale: one identity can host many destinations (`lxmf.delivery`,
+  `nomadnetwork.node`, propagation nodes, …), so identity-keyed access is
+  stable across protocols and maps directly onto future DACAR-based
+  permission management (§13) — grants are made to identities. The same
+  lesson was learned in `../signalk-reticulum`, which migrated crew entries
+  from destination hashes to identity hashes.
+- There is deliberately **no first-contact pairing**: a stray message can
+  never seize control.
 
 ### 6.2 Inbound pipeline
 
@@ -282,7 +294,7 @@ JSON, `0600`, unknown keys rejected with a warning.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `owner` | string | — | paired owner's 32-hex LXMF source hash; unset enables first-contact pairing |
+| `owner` | string | *(required)* | the owner's 32-hex **Reticulum identity hash** (not the LXMF address); expanded to the `lxmf.delivery` destination hash for wire comparison |
 | `name` | string | `pi-lxmf <version>` | announce display name |
 | `workdir` | string | daemon cwd | project directory Pi runs in (also where Pi discovers `AGENTS.md`) |
 | `model` | string | Pi default | `--model` pattern passed to Pi |
@@ -303,7 +315,6 @@ JSON, `0600`, unknown keys rejected with a warning.
   on graceful shutdown, and whenever `get_state` observes a change. On
   daemon start the pointer is passed as `--session` if the file still
   exists (a missing/empty pointer starts a fresh session).
-- `owner` — `{ "hash": … }` learned by first-contact pairing.
 
 **Operational note:** Pi's project trust is not prompted for over LXMF.
 Operators run Pi interactively once in `workdir` (or preconfigure trust) so
@@ -317,7 +328,8 @@ pi-lxmf/
 ├── CHANGELOG.md          # Keep a Changelog format, Unreleased segment
 ├── src/
 │   ├── bin.js            # CLI: flags (--config, --version), config load, daemon loop, signals
-│   ├── config.js         # load/merge/validate config; XDG paths; pairing-state + session-pointer persistence
+│   ├── config.js         # load/merge/validate config; XDG paths; session-pointer persistence
+│   ├── identity.js       # identity-hash → destination-hash derivation (DACAR-ready owner keying)
 │   ├── rpc.js            # PiRpcClient: spawn, JSONL framing, id correlation, typed command helpers, restart
 │   ├── lxmf.js           # mesh side: storage, identity, interfaces, router, announce, send (chunking), sync
 │   ├── bridge.js         # inbound pipeline, command dispatch, reply delivery, empty-tail recovery, dialogs
@@ -348,13 +360,13 @@ repository exists on the node.
 
 ## 11. Security model
 
-- **Owner-only control.** Exactly one LXMF identity can drive the agent.
+- **Owner-only control, configured not learned.** Exactly one Reticulum
+  identity (configured by identity hash; see §6.1) can drive the agent.
   Inbound LXMF messages are signature-verified by `LXMRouter` before
-  dispatch, so the source hash is authenticated.
-- **First-contact pairing risk.** With `owner` unset, whoever messages the
-  node first owns it. The window is bounded to the daemon's first run;
-  documentation must tell operators to preconfigure `owner` on shared
-  meshes.
+  dispatch, so the source is authenticated. There is no first-contact
+  pairing: a stray message can never seize control, and the daemon never
+  answers strangers. Identity-keyed access is ready for delegation to
+  DACAR-based permission management (§13) without reconfiguration.
 - **No shell surface.** The bridge never executes chat text locally; only
   Pi's RPC commands are used. The agent's own tool use is governed by Pi's
   normal permissions, not relaxed by the bridge. Declined dialogs mean
@@ -370,23 +382,27 @@ repository exists on the node.
 `node --test`, no network, no mesh:
 
 - `config.test.js` — defaults, XDG env overrides, merge precedence,
-  validation errors, owner-pairing and session-pointer persistence
-  round-trips.
+  validation errors, and session-pointer persistence round-trips.
 - `rpc.test.js` — the JSONL reader (chunked multi-byte UTF-8, `\r\n`
   tolerance, U+2028 inside strings must *not* split a record), and
   request/response correlation against a fake child stream.
+- `identity.test.js` — the identity → destination-hash derivation,
+  cross-validated against @reticulum/core's `Destination.IN` (so a configured
+  identity hash really expands to the wire form the router compares).
 - `commands.test.js` — command parsing (`/x`, `!`, bare `!`, case,
   args), model fuzzy matching over a fixture model list, command routing
   (bridge command vs passthrough prompt).
 - `bridge.test.js` — smoketests of the full loop with a fake `PiRpcClient`
   and a fake LXMF sender: prompt→reply delivery, mid-run steering choice,
   empty-tail recovery then nudge, `/new` + session pointer update,
-  dialog auto-dismiss, non-owner drop, first-contact pairing, chunking.
+  dialog auto-dismiss, non-owner drop (by derived destination hash),
+  chunking.
 
 Mesh-level behaviour is exercised end-to-end by `scripts/smoke.mjs` (`npm
 run smoke`), which needs a local rnsd shared instance: it spawns the real
 daemon against a fake `pi --mode rpc` child, pairs a second in-process LXMF
-node as the owner, and verifies pairing, a prompt round-trip, `/help`, and
+node as the owner (admitted via a preconfigured identity hash, exercising
+the derivation end-to-end), and verifies a prompt round-trip, `/help`, and
 reply chunking — all over real LXMF. Announce visibility against Sideband on
 an actual mesh is the remaining manual step.
 
@@ -400,7 +416,10 @@ an actual mesh is the remaining manual step.
   for exactly-once-ish delivery on top of LXMF's at-least-once.
 - **Proactive notifications:** mirror locally-started runs' output to the
   owner (pi-telegram's "connected companion projection").
-- **Multiple owners / per-hash permissions.**
+- **DACAR-based permissions** (../dacar): replace the single `owner`
+  identity with grants/revocations synced over the mesh, keyed by identity
+  hash as v1 already is.
+- **Multiple owners.**
 - **`/export` → LXMF attachment** of the rendered HTML session.
 - **Propagation-node role** for the bridge itself, serving its owner's
   messages while the daemon is down.

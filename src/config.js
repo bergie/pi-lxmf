@@ -2,7 +2,12 @@
  * @file config.js
  *
  * Configuration loading/validation and the small machine-managed state
- * files (owner pairing, Pi session pointer) described in SPEC §8.
+ * files (Pi session pointer) described in SPEC §8.
+ *
+ * The controlling owner is configured (required) by their **Reticulum
+ * identity hash** — protocol-agnostic, and the key a future DACAR-style
+ * permission system (../dacar) would grant to — never by an LXMF
+ * destination hash. `src/identity.js` derives the wire form.
  *
  * Config resolution order for the file itself: explicit `path` argument,
  * `$PI_LXMF_CONFIG`, then `$XDG_CONFIG_HOME/pi-lxmf/config.json`
@@ -34,12 +39,13 @@ const HEX32_RE = /^[0-9a-fA-F]{32}$/;
  * The resolved daemon configuration (output of {@link loadConfig}).
  *
  * @typedef {object} PiLxmfConfig
- * @property {string|null} owner - Paired owner's 32-hex source hash.
+ * @property {string} owner - Owner's 32-hex Reticulum identity hash (required;
+ *   NOT the `lxmf.delivery` destination hash / "LXMF Address").
  * @property {string} name - Announce display name.
  * @property {string} workdir - Project directory Pi runs in.
  * @property {string|null} model - `--model` pattern passed to Pi.
  * @property {string} piBin - Pi binary.
- * @property {string} dataDir - State root (storage, owner, session pointer).
+ * @property {string} dataDir - State root (storage, session pointer).
  * @property {string|null} rnsHost - rnsd TCP interface host (fallback).
  * @property {number|null} rnsPort - rnsd TCP interface port (fallback).
  * @property {string|null} propagationNode - `lxmf.propagation` hash.
@@ -51,7 +57,8 @@ const HEX32_RE = /^[0-9a-fA-F]{32}$/;
  */
 
 /**
- * Validates and normalises a 32-hex destination hash.
+ * Validates and normalises a 32-hex destination hash (e.g. an
+ * `lxmf.delivery` address; never a raw 64-hex identity hash).
  *
  * @param {unknown} value
  * @param {string} field
@@ -60,7 +67,9 @@ const HEX32_RE = /^[0-9a-fA-F]{32}$/;
 function hashField(value, field) {
   if (typeof value !== "string" || !HEX32_RE.test(value.trim())) {
     throw new ConfigError(
-      `Config field "${field}" must be a 32-hex-character destination hash, got: ${JSON.stringify(value)}`,
+      `Config field "${field}" must be a 32-hex-character hash ` +
+        `(for "owner", the Reticulum identity hash — not the LXMF address), ` +
+        `got: ${JSON.stringify(value)}`,
     );
   }
   return value.trim().toLowerCase();
@@ -177,6 +186,15 @@ export async function loadConfig(options = {}) {
   });
   const version = /** @type {{version?: string}} */ (pkg).version ?? "0.0.0";
 
+  if (raw.owner === undefined || raw.owner === null) {
+    throw new ConfigError(
+      'Config field "owner" is required: set it to your Reticulum identity ' +
+        "hash (32 hex chars — not the LXMF address). Messages from any other " +
+        "identity are dropped.",
+      configPath ?? undefined,
+    );
+  }
+
   const midRunBehavior =
     raw.midRunBehavior === undefined || raw.midRunBehavior === null
       ? "steer"
@@ -188,10 +206,7 @@ export async function loadConfig(options = {}) {
   }
 
   return {
-    owner:
-      raw.owner === undefined || raw.owner === null
-        ? null
-        : hashField(raw.owner, "owner"),
+    owner: hashField(raw.owner, "owner"),
     name:
       typeof raw.name === "string" && raw.name.trim()
         ? raw.name.trim()
@@ -260,31 +275,6 @@ function readStateFile(path) {
 function writeStateFile(path, data) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-}
-
-/**
- * Loads the paired owner hash, if any.
- *
- * @param {string} dataDir
- * @returns {string|null} 32-hex owner hash, or null when not yet paired.
- */
-export function readOwnerState(dataDir) {
-  const state = readStateFile(join(dataDir, "owner"));
-  const hash = state?.hash;
-  return typeof hash === "string" && HEX32_RE.test(hash) ? hash : null;
-}
-
-/**
- * Persists the paired owner hash.
- *
- * @param {string} dataDir
- * @param {string} hash - 32-hex owner hash.
- */
-export function writeOwnerState(dataDir, hash) {
-  writeStateFile(join(dataDir, "owner"), {
-    hash,
-    pairedAt: new Date().toISOString(),
-  });
 }
 
 /**

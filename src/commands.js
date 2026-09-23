@@ -99,7 +99,7 @@ export function formatStatus(state, bridgeInfo) {
     `session: ${session}`,
     `node: ${bridgeInfo.identityHash}`,
     `lxmf: ${bridgeInfo.deliveryHash}`,
-    `owner: ${bridgeInfo.owner ?? "(pairing: first contact)"}`,
+    `owner (identity): ${bridgeInfo.owner ?? "?"}`,
     `uptime: ${formatDuration(bridgeInfo.uptimeMs)}`,
   ].join("\n");
 }
@@ -124,7 +124,7 @@ export function formatSessionStats(stats) {
  * @typedef {object} CommandContext
  * @property {import("./rpc.js").PiRpcClient} rpc
  * @property {() => string} getTitle - Reply title (session name or node name).
- * @property {() => {identityHash: string, deliveryHash: string, owner: string|null, uptimeMs: number}} getBridgeInfo
+ * @property {() => {identityHash: string, deliveryHash: string, owner: string, uptimeMs: number}} getBridgeInfo
  */
 
 /**

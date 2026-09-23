@@ -17,14 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Mesh side (`src/lxmf.js`): persistent Reticulum identity, shared-instance →
     AutoInterface → TCP interface fallback, `LXMRouter` with periodic
     announcing, optional propagation-node sync, chunked outbound delivery.
-  - Bridge (`src/bridge.js`): owner-only access with first-contact pairing,
-    serialized inbound pipeline, prompts (steer/follow-up mid-run), assistant
+  - Bridge (`src/bridge.js`): owner-only access by configured Reticulum
+    identity hash (no first-contact pairing; derivation cross-validated
+    against @reticulum/core), serialized inbound pipeline, prompts (steer/follow-up mid-run), assistant
     reply delivery with empty-tail recovery, extension-dialog auto-dismissal.
   - Chat commands (`src/commands.js`): `/help`, `/status`, `/session`, `/new`,
     `/name`, `/compact`, `/model`, `/think`, `/abort`, `/quit`, and the bare
     `!` interrupt.
-  - Configuration and state (`src/config.js`): XDG-based config file, owner
-    pairing state, Pi session pointer persistence.
+  - Configuration and state (`src/config.js`): XDG-based config file with the
+    required `owner` identity hash, Pi session pointer persistence.
   - End-to-end smoketest (`scripts/smoke.mjs` + `scripts/fake-pi.mjs`): runs
     the real daemon against a fake `pi --mode rpc` and a second in-process
     LXMF owner over a local rnsd shared instance.

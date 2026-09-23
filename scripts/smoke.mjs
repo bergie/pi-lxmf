@@ -9,7 +9,9 @@
  *
  * What it exercises, all over real LXMF through rnsd:
  *  1. Daemon startup: config, shared-instance attach, announce, banner.
- *  2. First-contact pairing of the fake owner.
+ *  2. Owner admission by Reticulum identity hash (the config `owner` field
+ *     is preconfigured with the fake owner's identity hash, exercising the
+ *     identity → lxmf.destination-hash derivation end-to-end).
  *  3. A prompt round-trip through a fake `pi --mode rpc` child
  *     (`scripts/fake-pi.mjs`) — assistant reply delivered back over LXMF.
  *  4. The `/help` bridge command (no LLM turn).
@@ -58,25 +60,6 @@ try {
   writeFileSync(fakePi, `#!/usr/bin/sh\nexec node ${root}/fake-pi.mjs "$@"\n`);
   chmodSync(fakePi, 0o755);
 
-  // --- Daemon config ------------------------------------------------------
-  const configPath = join(work, "config.json");
-  const dataDir = join(work, "data");
-  writeFileSync(
-    configPath,
-    `${JSON.stringify(
-      {
-        name: "pi-lxmf smoke test",
-        workdir: work,
-        piBin: fakePi,
-        dataDir,
-        chunkChars: 100,
-        announceIntervalSec: 60,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-
   // --- The fake owner: a second LXMF node on the same rnsd ----------------
   const ownerRns = new Reticulum({
     storageAdapter: new FileStorageAdapter(join(work, "owner-storage")),
@@ -100,6 +83,26 @@ try {
       title: event.detail.message.title,
     });
   });
+
+  // --- Daemon config (needs the owner's identity hash) --------------------
+  const configPath = join(work, "config.json");
+  const dataDir = join(work, "data");
+  writeFileSync(
+    configPath,
+    `${JSON.stringify(
+      {
+        name: "pi-lxmf smoke test",
+        workdir: work,
+        piBin: fakePi,
+        dataDir,
+        chunkChars: 100,
+        announceIntervalSec: 60,
+        owner: toHex(ownerIdentity.identityHash),
+      },
+      null,
+      2,
+    )}\n`,
+  );
 
   // --- Start the daemon ---------------------------------------------------
   daemon = spawn(
@@ -173,30 +176,15 @@ try {
     await ownerLxmf.send(message, ownerIdentity);
   }
 
-  /**
-   * @param {number} count
-   * @param {number} [timeoutMs]
-   */
-  async function waitForMessages(count, timeoutMs = 30000) {
-    const until = Date.now() + timeoutMs;
-    while (received.length < count && Date.now() < until) await sleep(200);
-  }
-
-  // --- 1. Pairing + prompt round-trip --------------------------------------
-  // chunkChars is 100, so multi-part replies arrive as several messages.
+  // --- 1. Prompt round-trip (owner admitted by identity hash) --------------
   await sendToDaemon("hello bridge");
-  await waitForMessages(3, 15000); // pairing notice (2 chunks) + echo reply
-  const afterPairing = Date.now();
+  const echoUntil = Date.now() + 15000;
   while (
-    Date.now() - afterPairing < 15000 &&
-    !received.some((m) => m.content.startsWith("You said:"))
+    Date.now() < echoUntil &&
+    !received.some((m) => m.content === "You said: hello bridge")
   ) {
     await sleep(200);
   }
-  check(
-    "first contact pairing notice delivered",
-    /^Paired: this Pi node/.test(received[0]?.content ?? ""),
-  );
   const echo = received.find((m) => m.content === "You said: hello bridge");
   check("prompt round-trip through fake pi", Boolean(echo));
   if (!echo) {
@@ -239,7 +227,7 @@ try {
 
   // --- Wrap up ---------------------------------------------------------------
   console.log(
-    `      pairing state file: ${readFileSync(join(dataDir, "owner"), "utf8").split("\n")[0]}`,
+    `      config owner (identity): ${JSON.parse(readFileSync(configPath, "utf8")).owner}`,
   );
 } catch (e) {
   check(`smoke crashed: ${e?.message ?? e}`, false);

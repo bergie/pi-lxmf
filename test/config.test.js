@@ -1,6 +1,6 @@
 /**
  * Tests for configuration loading, validation and the machine-managed
- * state files (owner pairing, session pointer).
+ * state files (session pointer).
  */
 
 import { strict as assert } from "node:assert";
@@ -14,9 +14,7 @@ import {
   defaultConfigPath,
   defaultDataDir,
   loadConfig,
-  readOwnerState,
   readSessionPointer,
-  writeOwnerState,
   writeSessionPointer,
 } from "../src/config.js";
 
@@ -36,14 +34,35 @@ async function loadWith(raw = {}, options = {}) {
   }
 }
 
-test("defaults when no config file exists", async () => {
+test("defaults when no config file exists (owner required)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-lxmf-cfg-"));
+  await assert.rejects(
+    loadConfig({
+      path: join(dir, "missing.json"),
+      env: {},
+      cwd: "/tmp/project",
+    }),
+    /"owner" is required/,
+  );
   const config = await loadConfig({
     path: join(dir, "missing.json"),
     env: {},
     cwd: "/tmp/project",
-  });
-  assert.equal(config.owner, null);
+    // Simulate the env-var config override for the required owner.
+  }).catch(() => null);
+  assert.equal(config, null);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("defaults resolve with owner set", async () => {
+  const config = await loadWith(
+    { owner: "abcdef0123456789abcdef0123456789" },
+    {
+      env: {},
+      cwd: "/tmp/project",
+    },
+  );
+  assert.equal(config.owner, "abcdef0123456789abcdef0123456789");
   assert.match(config.name, /^pi-lxmf \d+\.\d+\.\d+/);
   assert.equal(config.workdir, "/tmp/project");
   assert.equal(config.model, null);
@@ -52,8 +71,7 @@ test("defaults when no config file exists", async () => {
   assert.equal(config.midRunBehavior, "steer");
   assert.equal(config.chunkChars, 2500);
   assert.equal(config.announceIntervalSec, null);
-  assert.equal(config.configPath, null);
-  rmSync(dir, { recursive: true, force: true });
+  assert.ok(config.configPath); // loadWith writes a real config file
 });
 
 test("XDG paths and PI_LXMF_CONFIG override", () => {
@@ -121,23 +139,12 @@ test("warns about unknown keys", async () => {
   /** @type {string[]} */
   const warnings = [];
   const config = await loadWith(
-    { owners: "x" },
+    { owner: "abcdef0123456789abcdef0123456789", owners: "x" },
     { warn: (/** @type {string} */ msg) => warnings.push(msg) },
   );
-  assert.equal(config.owner, null);
+  assert.equal(config.owner, "abcdef0123456789abcdef0123456789");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /unknown config key "owners"/);
-});
-
-test("owner pairing state round-trip", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-lxmf-state-"));
-  try {
-    assert.equal(readOwnerState(dir), null);
-    writeOwnerState(dir, "abcdef0123456789abcdef0123456789");
-    assert.equal(readOwnerState(dir), "abcdef0123456789abcdef0123456789");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test("session pointer round-trip and corrupt tolerance", () => {
@@ -153,7 +160,7 @@ test("session pointer round-trip and corrupt tolerance", () => {
     assert.equal(readSessionPointer(dir), null);
     // A dataDir that does not exist yet is fine.
     mkdirSync(join(dir, "nested"));
-    assert.equal(readOwnerState(join(dir, "nested")), null);
+    assert.equal(readSessionPointer(join(dir, "nested")), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

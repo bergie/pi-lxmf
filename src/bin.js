@@ -12,9 +12,7 @@ import { basename } from "node:path";
 import { Bridge } from "./bridge.js";
 import {
   loadConfig,
-  readOwnerState,
   readSessionPointer,
-  writeOwnerState,
   writeSessionPointer,
 } from "./config.js";
 import { startLxmf } from "./lxmf.js";
@@ -154,8 +152,7 @@ async function main() {
   bannerLine("lxmf", mesh.deliveryHash);
   bannerLine("announce", config.name);
 
-  const paired = config.owner ?? readOwnerState(config.dataDir);
-  bannerLine("owner", paired ?? "(pairing: first sender wins)");
+  bannerLine("owner (identity)", config.owner);
 
   const sessionPointer = readSessionPointer(config.dataDir);
   if (sessionPointer) {
@@ -181,8 +178,6 @@ async function main() {
     rpc,
     mesh,
     state: {
-      loadOwner: () => readOwnerState(config.dataDir),
-      saveOwner: (hash) => writeOwnerState(config.dataDir, hash),
       loadSession: () => readSessionPointer(config.dataDir),
       saveSession: (file) => writeSessionPointer(config.dataDir, file),
     },

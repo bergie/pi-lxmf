@@ -10,13 +10,14 @@ client** — [Sideband](https://github.com/markqvist/Sideband),
 `pi-lxmf` is a small daemon for headless servers: your chat messages become
 prompts, finished assistant replies are delivered back as chat messages, and
 the usual Pi controls (`/new`, `/compact`, `/abort`, model and thinking
-switches) work from chat. One paired LXMF identity (the *owner*) controls the
-agent; everyone else is ignored. Architecture and internals: [SPEC.md](SPEC.md).
+switches) work from chat. Exactly one configured owner — identified by their
+**Reticulum identity hash** — controls the agent; everyone else is ignored.
+Architecture and internals: [SPEC.md](SPEC.md).
 
 ```text
 Sideband / NomadNet ◄──LXMF──► pi-lxmf daemon ◄──RPC──► pi --mode rpc
                               (identity, announce,     (supervised child,
-                               pairing, session)        restartable)
+                               session)                 restartable)
 ```
 
 ## Requirements
@@ -45,12 +46,16 @@ node src/bin.js --help
      "name": "pi on myserver",
      "workdir": "/srv/myproject",
      "model": "anthropic/claude-sonnet-4-5",
-     "owner": "<your Sideband LXMF address, 32 hex chars>"
+     "owner": "<your Reticulum identity hash, 32 hex chars>"
    }
    ```
 
-   Omit `owner` to pair on first contact instead (see
-   [Security](#security)).
+   `owner` is **required** and takes your **Reticulum identity hash** — the
+   32-hex identifier of your Ed25519 identity, *not* the `lxmf.delivery`
+   destination hash ("LXMF Address") your client displays. The identity hash
+   is protocol-agnostic (the same you across LXMF, Nomadnet, …) and is what a
+   future DACAR-style permission system would grant to; the daemon derives
+   the wire form internally.
 
 2. **Run the daemon** in the project directory (or set `workdir`):
 
@@ -65,14 +70,13 @@ node src/bin.js --help
      identity   6bd23ddae42b6ab1b90ef1ce62a41f31
      lxmf       92b5be0e43370f01de77126b0eb11b53
      announce   pi on myserver
-     owner      <pairing: first sender wins>
+     owner (identity) 3f9dd04e9216c0a3b8c7e5f1d2a60b44
    pi-lxmf: ready — listening for LXMF messages
    ```
 
 3. **Say hello** — in Sideband, start a conversation with the daemon's LXMF
    address (scan the announce or enter the hash manually) and send a message.
-   If `owner` was unset, the first sender is paired permanently and confirmed
-   with a reply.
+   Only the configured owner is answered; everyone else is dropped.
 
 4. **Trust the project once** — Pi's project trust cannot be prompted over
    LXMF. Run `pi` interactively once in `workdir` (or preconfigure trust) so
@@ -84,7 +88,7 @@ node src/bin.js --help
 |---|---|
 | plain text | a prompt to the agent (steered into a running turn by default) |
 | `/help` | bridge commands + Pi commands available via prompt |
-| `/status` | model, thinking, session, uptime, node/owner hashes |
+| `/status` | model, thinking, session, uptime, node + owner identity hashes |
 | `/session` | message counts, tokens, cost, context usage |
 | `/new` | fresh Pi session |
 | `/name [name]` | show / set the session display name |
@@ -108,7 +112,7 @@ on defaults.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `owner` | — | 32-hex LXMF source hash allowed to drive the agent; unset = first-contact pairing |
+| `owner` | *(required)* | the owner's 32-hex **Reticulum identity hash** (not the LXMF address); the daemon derives the `lxmf.delivery` destination hash for wire comparison |
 | `name` | `pi-lxmf <version>` | announce display name |
 | `workdir` | daemon cwd | project directory Pi runs in (also where `AGENTS.md` is found) |
 | `model` | Pi default | `--model` pattern passed to Pi |
@@ -126,7 +130,6 @@ on defaults.
 - `storage/` — the node's persistent Reticulum identity and caches. **This key
   is the node's address; back it up and keep it secret.** Deleting it changes
   your LXMF address.
-- `owner` — the paired owner hash.
 - `session` — pointer to the current Pi session file. Sessions survive daemon
   restarts (`pi --session`); `/new` starts a fresh one.
 
@@ -144,10 +147,14 @@ retrieves messages that arrived while the daemon was down.
 
 ## Security
 
-- Inbound LXMF messages are **signature-verified by the router**; only the
-  paired owner's source hash is processed, others are dropped silently.
-- **First-contact pairing is a race window**: with `owner` unset, whoever
-  messages the node first owns it. On shared meshes, preconfigure `owner`.
+- Inbound LXMF messages are **signature-verified by the router**; only
+  messages from the configured owner's identity are processed (matched via
+  the derived `lxmf.delivery` destination hash), everyone else is dropped
+  silently — the daemon never answers strangers.
+- The owner is **configured, never learned**: there is no first-contact
+  pairing, so a stray message can never seize control.
+- Access is keyed by **identity hash**, so it can later be delegated to a
+  DACAR-style permission system without reconfiguration.
 - The bridge never executes chat text locally — everything goes through Pi's
   RPC protocol. Approval-gated tools stay gated (dialogs are declined).
 - `/quit` and full agent control are available to the owner only.
