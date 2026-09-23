@@ -48,6 +48,10 @@ const HEX32_RE = /^[0-9a-fA-F]{32}$/;
  * @property {string} dataDir - State root (storage, session pointer).
  * @property {string|null} rnsHost - rnsd TCP interface host (fallback).
  * @property {number|null} rnsPort - rnsd TCP interface port (fallback).
+ * @property {boolean} skipSharedInstance - Do not attach to the local rnsd
+ *   shared instance; bring up own interfaces (AutoInterface + the optional
+ *   `rnsHost`/`rnsPort` TCP client) instead. Needed where the shared rnsd
+ *   fails to forward routed (multi-hop) traffic to its local clients.
  * @property {string|null} propagationNode - `lxmf.propagation` hash.
  * @property {number} syncIntervalSec - Propagation sync cadence (0 = off).
  * @property {"steer"|"followUp"} midRunBehavior - streamingBehavior for mid-run prompts.
@@ -94,6 +98,22 @@ function intField(value, field, fallback, min = 0) {
 }
 
 /**
+ * @param {unknown} value
+ * @param {string} field
+ * @param {boolean} fallback
+ * @returns {boolean}
+ */
+function boolField(value, field, fallback) {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "boolean") {
+    throw new ConfigError(
+      `Config field "${field}" must be a boolean, got: ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+/**
  * Default config file path (`$PI_LXMF_CONFIG`, then XDG).
  *
  * @param {Record<string, string|undefined>} [env] - Defaults to `process.env`.
@@ -131,6 +151,7 @@ const KNOWN_KEYS = {
   dataDir: {},
   rnsHost: {},
   rnsPort: {},
+  skipSharedInstance: {},
   propagationNode: {},
   syncIntervalSec: {},
   midRunBehavior: {},
@@ -233,6 +254,11 @@ export async function loadConfig(options = {}) {
       raw.rnsPort === undefined || raw.rnsPort === null
         ? null
         : intField(raw.rnsPort, "rnsPort", 0, 1),
+    skipSharedInstance: boolField(
+      raw.skipSharedInstance,
+      "skipSharedInstance",
+      false,
+    ),
     propagationNode:
       raw.propagationNode === undefined || raw.propagationNode === null
         ? null

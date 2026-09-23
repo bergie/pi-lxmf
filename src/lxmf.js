@@ -55,7 +55,15 @@ export async function startLxmf(config, options = {}) {
 
   /** @type {string[]} */
   const interfaceNames = [];
-  const shared = await LocalClientInterface.connectToSharedInstance();
+  // Attaching to a local rnsd shared instance only works for 0-hop local
+  // traffic in some setups: a shared rnsd that does not forward routed
+  // (multi-hop) traffic to its local clients (observed Termux↔Columba,
+  // where the daemon's announces reach the mesh but inbound link requests
+  // die at the rnsd) silently blackholes every remote message.
+  // `skipSharedInstance` opts out in favour of own interfaces.
+  const shared = config.skipSharedInstance
+    ? null
+    : await LocalClientInterface.connectToSharedInstance();
   if (shared) {
     // The generated @reticulum types hold two path identities for Interface
     // (src/ vs types/), which strict tsc rejects; the runtime types match.
@@ -137,8 +145,13 @@ export async function startLxmf(config, options = {}) {
 
   /**
    * Sends `text` to `destinationHex` (a 32-hex lxmf.delivery source hash),
-   * chunked to `chunkChars`, titled on the first chunk. Retries each chunk
-   * once before giving up (mesh sends can fail transiently).
+   * chunked to `chunkChars`, titled on the first chunk. A failed send is
+   * retried once over the same path, then once more opportunistically
+   * (without the link) — battery-conscious mobile clients tear their link
+   * down right after their message is acknowledged, so the arrival link can
+   * be gone by reply time; the same `LXMessage` object is re-sent so both
+   * wire copies share one message id and a deduplicating client shows the
+   * reply once (learned in signalk-reticulum's deliverer).
    *
    * @param {string} destinationHex
    * @param {string} text
@@ -174,7 +187,19 @@ export async function startLxmf(config, options = {}) {
       log(
         `pi-lxmf: LXMF send failed (${e instanceof Error ? e.message : e}), retrying once`,
       );
-      await lxmf.send(message, identity, link);
+      try {
+        await lxmf.send(message, identity, link);
+      } catch (e2) {
+        // The arrival link is likely gone (the peer closed it after its
+        // message was acknowledged). Retry without it: `LXMRouter.send`
+        // then establishes a fresh DIRECT link, falling back to an
+        // opportunistic packet. Same message object → same message id, so
+        // a deduplicating client renders the reply once.
+        log(
+          `pi-lxmf: link retry failed (${e2 instanceof Error ? e2.message : e2}), retrying without link`,
+        );
+        await lxmf.send(message, identity, null);
+      }
     }
   }
 

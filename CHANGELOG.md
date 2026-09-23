@@ -16,7 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     readiness probing, crash-restart with backoff and a crash-loop guard.
   - Mesh side (`src/lxmf.js`): persistent Reticulum identity, shared-instance →
     AutoInterface → TCP interface fallback, `LXMRouter` with periodic
-    announcing, optional propagation-node sync, chunked outbound delivery.
+    announcing, optional propagation-node sync, chunked outbound delivery. A
+    `skipSharedInstance` config option bypasses the local rnsd shared instance
+    entirely in favour of own interfaces (AutoInterface + the `rnsHost`/
+    `rnsPort` TCP client) — for shared instances that do not forward routed,
+    multi-hop traffic to their local clients (observed on a Termux↔Columba
+    setup where the daemon's announces reached the mesh but every inbound link
+    request died at the rnsd, so senders never got delivery proofs). The
+    startup banner now also lists the attached interfaces.
   - Bridge (`src/bridge.js`): owner-only access by configured Reticulum
     identity hash (no first-contact pairing; derivation cross-validated
     against @reticulum/core), serialized inbound pipeline, prompts (steer/follow-up mid-run), assistant

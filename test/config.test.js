@@ -100,6 +100,7 @@ test("loads and normalises values", async () => {
     announceIntervalSec: 900,
     rnsHost: "127.0.0.1",
     rnsPort: 42424,
+    skipSharedInstance: true,
     propagationNode: "1234567890abcdef1234567890abcdef",
     syncIntervalSec: 60,
   });
@@ -111,6 +112,7 @@ test("loads and normalises values", async () => {
   assert.equal(config.chunkChars, 1200);
   assert.equal(config.announceIntervalSec, 900);
   assert.equal(config.rnsPort, 42424);
+  assert.equal(config.skipSharedInstance, true);
   assert.equal(config.propagationNode, "1234567890abcdef1234567890abcdef");
   assert.equal(config.syncIntervalSec, 60);
   assert.ok(config.configPath);
@@ -145,6 +147,20 @@ test("warns about unknown keys", async () => {
   assert.equal(config.owner, "abcdef0123456789abcdef0123456789");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /unknown config key "owners"/);
+});
+
+test("skipSharedInstance defaults to false and rejects non-booleans", async () => {
+  const config = await loadWith({
+    owner: "abcdef0123456789abcdef0123456789",
+  });
+  assert.equal(config.skipSharedInstance, false);
+  await assert.rejects(
+    loadWith({
+      owner: "abcdef0123456789abcdef0123456789",
+      skipSharedInstance: "yes",
+    }),
+    /skipSharedInstance.*boolean/,
+  );
 });
 
 test("session pointer round-trip and corrupt tolerance", () => {

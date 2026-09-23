@@ -150,6 +150,7 @@ async function main() {
   const mesh = await startLxmf(config);
   bannerLine("identity", mesh.identityHash);
   bannerLine("lxmf", mesh.deliveryHash);
+  bannerLine("interfaces", mesh.interfaceNames.join(", "));
   bannerLine("announce", config.name);
 
   bannerLine("owner (identity)", config.owner);
