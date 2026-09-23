@@ -48,9 +48,17 @@ import { chunkText } from "./text.js";
  *
  * @param {LXMRouter} lxmf - An initialised router.
  * @param {(msg: string) => void} [log] - Diagnostic sink.
+ * @param {string} [ownerIdentityHash] - 32-hex identity hash of the
+ *   configured owner; when set, only peer-learn events whose announce
+ *   carries this identity are logged (other peers are routine mesh
+ *   bookkeeping).
  * @returns {() => void} unsubscribe
  */
-export function attachInboundDiagnostics(lxmf, log = () => {}) {
+export function attachInboundDiagnostics(
+  lxmf,
+  log = () => {},
+  ownerIdentityHash,
+) {
   const onData = async (/** @type {any} */ event) => {
     const plaintext = event?.detail?.plaintext;
     if (!plaintext) return;
@@ -78,7 +86,14 @@ export function attachInboundDiagnostics(lxmf, log = () => {}) {
 
   const onPeer = (/** @type {any} */ event) => {
     const destinationHash = event?.detail?.destinationHash;
-    if (destinationHash) {
+    const identity = event?.detail?.identity;
+    const identityHash = identity?.identityHash;
+    if (
+      destinationHash &&
+      (!ownerIdentityHash ||
+        (identityHash &&
+          toHex(identityHash) === ownerIdentityHash.toLowerCase()))
+    ) {
       log(`pi-lxmf: learned LXMF peer ${toHex(destinationHash)}`);
     }
   };
@@ -189,7 +204,7 @@ export async function startLxmf(config, options = {}) {
 
   // Instrument the inbound path so a silently-parked or failing message is
   // visible in the daemon log (see attachInboundDiagnostics).
-  const detachDiagnostics = attachInboundDiagnostics(lxmf, log);
+  const detachDiagnostics = attachInboundDiagnostics(lxmf, log, config.owner);
 
   // Immediate announce + periodic re-announce so cached mesh paths stay
   // fresh and peers (Sideband/Nomadnet) show our display name.

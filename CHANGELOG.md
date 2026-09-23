@@ -41,8 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     packet that decrypts but never dispatches. When the sender's identity
     is unknown the router parks the message until an announce arrives (the
     most common reason a sender sees its packet acknowledged but the bridge
-    never receives anything), and that is now logged along with the
-    announce that later releases it; unparseable packets are logged too.
+    never receives anything), and that is now logged; unparseable packets
+    are logged too. The peer-learn (`"peer"` event) log is filtered to the
+    configured owner identity only — routine mesh peers are no longer
+    logged.
     Successfully-dispatched owner traffic is intentionally silent here —
     the bridge logs its disposition (ignored / command / prompt) where the
     decision is made. Ported from signalk-reticulum where this
