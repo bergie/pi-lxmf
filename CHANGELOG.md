@@ -37,14 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the real daemon against a fake `pi --mode rpc` and a second in-process
     LXMF owner over a local rnsd shared instance.
   - Inbound LXMF diagnostics (`attachInboundDiagnostics` in `src/lxmf.js`):
-    the daemon now logs every decrypted inbound packet with its source hash
-    and whether the sender's identity is known — when it is unknown the
-    router parks the message until an announce arrives, which is the most
-    common reason a sender sees its packet acknowledged but the bridge
-    never receives anything. Peer-announce learning is logged too, so a
-    parked message can be correlated with the announce that released it.
-    Ported from signalk-reticulum where this instrumentation proved out the
-    identity-parking failure mode.
+    surfaces the inbound failure mode the bridge itself can't see — a
+    packet that decrypts but never dispatches. When the sender's identity
+    is unknown the router parks the message until an announce arrives (the
+    most common reason a sender sees its packet acknowledged but the bridge
+    never receives anything), and that is now logged along with the
+    announce that later releases it; unparseable packets are logged too.
+    Successfully-dispatched owner traffic is intentionally silent here —
+    the bridge logs its disposition (ignored / command / prompt) where the
+    decision is made. Ported from signalk-reticulum where this
+    instrumentation proved out the identity-parking failure mode.
   - Outbound reply fallback: a failed reply over the arrival link is now
     retried once more without the link (fresh DIRECT link, then
     opportunistic packet). Battery-conscious mobile clients tear their
@@ -64,5 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `sendReaction(destinationHex, targetMessageId, emoji, opts)` to the
     mesh adapter (`src/lxmf.js`), reusing the same retry path as
     `sendText`.
+- Fixed bzip2 compression provider (`src/bz2.js`): the wasm `compress()`
+  defaults its output buffer to the input length, so an LXMF reply that
+  compressed worse than its input (incompressible / small / already-
+  compressed data) threw `BZ_OUTBUFF_FULL` and failed delivery. The adapter
+  now sizes the output buffer with bzip2's documented worst-case headroom
+  (`input + 1% + 600` bytes).
 - GitHub Actions CI: tests (with lint and type checks) on every push, and
   OIDC-based npm publishing on tag pushes (no registry token stored).
