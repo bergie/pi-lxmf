@@ -36,5 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - End-to-end smoketest (`scripts/smoke.mjs` + `scripts/fake-pi.mjs`): runs
     the real daemon against a fake `pi --mode rpc` and a second in-process
     LXMF owner over a local rnsd shared instance.
+  - Inbound LXMF diagnostics (`attachInboundDiagnostics` in `src/lxmf.js`):
+    the daemon now logs every decrypted inbound packet with its source hash
+    and whether the sender's identity is known — when it is unknown the
+    router parks the message until an announce arrives, which is the most
+    common reason a sender sees its packet acknowledged but the bridge
+    never receives anything. Peer-announce learning is logged too, so a
+    parked message can be correlated with the announce that released it.
+    Ported from signalk-reticulum where this instrumentation proved out the
+    identity-parking failure mode.
+  - Outbound reply fallback: a failed reply over the arrival link is now
+    retried once more without the link (fresh DIRECT link, then
+    opportunistic packet). Battery-conscious mobile clients tear their
+    link down right after their own message is acknowledged, so the arrival
+    link is frequently gone by reply time. The same `LXMessage` object is
+    re-sent so every wire copy shares one message id and a deduplicating
+    client (Sideband, NomadNet) renders the reply once.
 - GitHub Actions CI: tests (with lint and type checks) on every push, and
   OIDC-based npm publishing on tag pushes (no registry token stored).

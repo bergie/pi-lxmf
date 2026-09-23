@@ -23,6 +23,85 @@ import { createBz2 } from "./bz2.js";
 import { chunkText } from "./text.js";
 
 /**
+ * Attaches diagnostic logging to the inbound LXMF choke points that the
+ * bridge itself can't see: packets that decrypt but never dispatch.
+ *
+ * The `lxmf.delivery` destination emits a `"data"` event the instant a
+ * single-packet message decrypts — before the router has resolved the
+ * sender's identity. When the identity is UNKNOWN the router parks the
+ * message and solicits a path/announce, and it is only dispatched once
+ * that announce arrives. This is the most common reason a sender sees
+ * its packet acknowledged but the bridge never logs receiving anything,
+ * so we surface it here (along with unparseable packets) rather than at
+ * the bridge, which only ever sees successfully dispatched messages.
+ *
+ * Normal, successfully-dispatched packets are intentionally silent here —
+ * the bridge logs their disposition (ignored / command / prompt) where it
+ * actually decides what to do with them.
+ *
+ * The router's `"peer"` event fires when an announce (or inbound-link
+ * LINKIDENTIFY) makes an identity available, so a parked message can be
+ * correlated with the announce that released it.
+ *
+ * Ported from signalk-reticulum's `attachInboundDiagnostics`, where this
+ * instrumentation proved out the identity-parking failure mode.
+ *
+ * @param {LXMRouter} lxmf - An initialised router.
+ * @param {(msg: string) => void} [log] - Diagnostic sink.
+ * @returns {() => void} unsubscribe
+ */
+export function attachInboundDiagnostics(lxmf, log = () => {}) {
+  const onData = async (/** @type {any} */ event) => {
+    const plaintext = event?.detail?.plaintext;
+    if (!plaintext) return;
+    try {
+      const parsed = await LXMessage.deserialize(
+        plaintext,
+        lxmf.deliveryDest?.destinationHash ?? undefined,
+      );
+      const known = await lxmf.rns.transport.recallIdentity(parsed.sourceHash);
+      if (!known) {
+        log(
+          `pi-lxmf: inbound packet from ${toHex(parsed.sourceHash || [])} ` +
+            `(${plaintext.length} bytes) parked — sender identity unknown, ` +
+            `waiting for announce/path`,
+        );
+      }
+    } catch (e) {
+      log(
+        `pi-lxmf: inbound packet (${plaintext.length} bytes) could not be ` +
+          `parsed: ${e instanceof Error ? e.message : e}`,
+      );
+    }
+  };
+  /** @type {any} */ (lxmf.deliveryDest).addEventListener("data", onData);
+
+  const onPeer = (/** @type {any} */ event) => {
+    const destinationHash = event?.detail?.destinationHash;
+    if (destinationHash) {
+      log(`pi-lxmf: learned LXMF peer ${toHex(destinationHash)}`);
+    }
+  };
+  lxmf.addEventListener("peer", onPeer);
+
+  return () => {
+    try {
+      /** @type {any} */ (lxmf.deliveryDest)?.removeEventListener(
+        "data",
+        onData,
+      );
+    } catch {
+      /* best effort */
+    }
+    try {
+      lxmf.removeEventListener("peer", onPeer);
+    } catch {
+      /* best effort */
+    }
+  };
+}
+
+/**
  * Starts the mesh side. Resolves once the LXMF delivery destination is
  * registered and announcing has begun.
  *
@@ -105,6 +184,10 @@ export async function startLxmf(config, options = {}) {
     /** @type {Uint8Array} */ (deliveryDest.destinationHash),
   );
   log(`pi-lxmf: lxmf.delivery destination ${deliveryHash}`);
+
+  // Instrument the inbound path so a silently-parked or failing message is
+  // visible in the daemon log (see attachInboundDiagnostics).
+  const detachDiagnostics = attachInboundDiagnostics(lxmf, log);
 
   // Immediate announce + periodic re-announce so cached mesh paths stay
   // fresh and peers (Sideband/Nomadnet) show our display name.
@@ -212,6 +295,7 @@ export async function startLxmf(config, options = {}) {
     interfaceNames,
     sendText,
     stop() {
+      detachDiagnostics();
       lxmf.stopAnnouncing();
       if (syncTimer) clearInterval(syncTimer);
     },

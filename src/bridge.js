@@ -202,14 +202,17 @@ export class Bridge {
 
     if (sourceHex !== this.ownerDestinationHash) {
       this.log.log(
-        `pi-lxmf: dropped message from unauthorized source ${sourceHex}`,
+        `pi-lxmf: inbound from ${sourceHex}: dropped (not the owner)`,
       );
       return;
     }
 
     const content =
       typeof message.content === "string" ? message.content.trim() : "";
-    if (!content) return;
+    if (!content) {
+      this.log.log("pi-lxmf: inbound from owner: ignored (empty body)");
+      return;
+    }
     this.lastLink = link ?? this.lastLink;
 
     // Serialize all inbound handling so prompts and commands keep order.
@@ -233,12 +236,14 @@ export class Bridge {
     const parsed = parseCommand(content);
     if (parsed) {
       if (parsed.name === "") {
+        this.log.log("pi-lxmf: inbound from owner: abort (interrupt)");
         this.rpc.abort();
         await this.deliver("⛔ aborted (queue intact).");
         return;
       }
       const command = bridgeCommands[parsed.name];
       if (command) {
+        this.log.log(`pi-lxmf: inbound from owner: command /${parsed.name}`);
         try {
           const result = await command.run(this.commandContext(), parsed.args);
           const text = typeof result === "string" ? result : result?.text;
@@ -255,6 +260,9 @@ export class Bridge {
       // skills, and anything else becomes a normal prompt.
     }
 
+    this.log.log(
+      `pi-lxmf: inbound from owner: prompt (${content.length} chars)`,
+    );
     await this.sendPrompt(content, link);
   }
 
