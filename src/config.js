@@ -15,7 +15,14 @@
  * error — the daemon runs on defaults (and first-contact pairing).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -304,25 +311,83 @@ function writeStateFile(path, data) {
 }
 
 /**
- * Loads the persisted Pi session pointer, if any.
- *
- * @param {string} dataDir
- * @returns {{sessionFile: string}|null}
+ * The pre-migration session pointer path (kept for one-time adoption; see
+ * {@link readSessionPointer}).
  */
-export function readSessionPointer(dataDir) {
-  const state = readStateFile(join(dataDir, "session"));
-  const sessionFile = state?.sessionFile;
-  return typeof sessionFile === "string" && sessionFile
-    ? { sessionFile }
-    : null;
+const LEGACY_SESSION_FILE = "session";
+
+/**
+ * Directory under `dataDir` holding the per-workdir session pointers.
+ */
+const SESSIONS_DIR = "sessions";
+
+/**
+ * A stable, filesystem-safe key for a `workdir`: the first 16 hex chars of
+ * its SHA-256. The key is the absolute path only — not the model, not a
+ * session name — so switching models mid-session keeps the same pointer
+ * (the session is the conversation; the model is orthogonal).
+ *
+ * @param {string} workdir - Absolute workdir (the key is the path only).
+ * @returns {string} a 16-char hex key.
+ */
+function workdirKey(workdir) {
+  return createHash("sha256").update(workdir).digest("hex").slice(0, 16);
 }
 
 /**
- * Persists the Pi session pointer (the JSONL file `pi --session` resumes).
+ * The per-workdir session-pointer file path under `dataDir`.
  *
  * @param {string} dataDir
+ * @param {string} workdir
+ * @returns {string}
+ */
+function sessionPointerPath(dataDir, workdir) {
+  return join(dataDir, SESSIONS_DIR, `${workdirKey(workdir)}.json`);
+}
+
+/**
+ * Loads the persisted Pi session pointer for `workdir`, if any.
+ *
+ * One-time migration: if no per-workdir pointer exists yet but the legacy
+ * `${dataDir}/session` file does, it is adopted for the current workdir
+ * (the last session was here) and the legacy file is removed, so the
+ * adoption runs exactly once. A workdir with no pointer and no legacy file
+ * starts empty (fresh session).
+ *
+ * @param {string} dataDir
+ * @param {string} workdir - The resolved workdir the pointer is scoped to.
+ * @returns {{sessionFile: string}|null}
+ */
+export function readSessionPointer(dataDir, workdir) {
+  const path = sessionPointerPath(dataDir, workdir);
+  const existing = readStateFile(path);
+  if (existing && typeof existing.sessionFile === "string") {
+    return { sessionFile: existing.sessionFile };
+  }
+  // One-time adoption of the legacy single-file pointer.
+  const legacyPath = join(dataDir, LEGACY_SESSION_FILE);
+  const legacy = readStateFile(legacyPath);
+  if (legacy?.sessionFile && typeof legacy.sessionFile === "string") {
+    writeStateFile(path, { sessionFile: legacy.sessionFile });
+    try {
+      rmSync(legacyPath, { force: true });
+    } catch {
+      /* best effort — the adoption already wrote the new pointer */
+    }
+    return { sessionFile: legacy.sessionFile };
+  }
+  return null;
+}
+
+/**
+ * Persists the Pi session pointer for `workdir` (the JSONL file `pi
+ * --session` resumes), keyed by the workdir so distinct repos keep distinct
+ * sessions.
+ *
+ * @param {string} dataDir
+ * @param {string} workdir - The resolved workdir the pointer is scoped to.
  * @param {string} sessionFile - Absolute path to the session file.
  */
-export function writeSessionPointer(dataDir, sessionFile) {
-  writeStateFile(join(dataDir, "session"), { sessionFile });
+export function writeSessionPointer(dataDir, workdir, sessionFile) {
+  writeStateFile(sessionPointerPath(dataDir, workdir), { sessionFile });
 }

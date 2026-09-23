@@ -341,10 +341,16 @@ JSON, `0600`, unknown keys rejected with a warning.
 
 - `storage/` — Reticulum persistence (identity, known destinations,
   ratchets) via `FileStorageAdapter`.
-- `session` — `{ "sessionFile": … }` pointer; written on `new_session`,
-  on graceful shutdown, and whenever `get_state` observes a change. On
-  daemon start the pointer is passed as `--session` if the file still
-  exists (a missing/empty pointer starts a fresh session).
+- `sessions/<key>.json` — per-workdir Pi session pointers
+  (`{ "sessionFile": … }`), keyed by the first 16 hex chars of
+  `SHA-256(workdir)` so distinct repos keep distinct sessions (the session
+  is the conversation; switching models mid-session keeps the same pointer).
+  Written on `new_session`, on graceful shutdown, and whenever
+  `get_state` observes a change. On daemon start the pointer for the
+  current `workdir` is passed as `--session` if it still exists (a
+  missing/empty pointer starts a fresh session). One-time migration: a
+  pre-scoping legacy `session` file is adopted for the first workdir that
+  reads it, then removed, so the adoption runs exactly once.
 
 **Operational note:** Pi's project trust is not prompted for over LXMF.
 Operators run Pi interactively once in `workdir` (or preconfigure trust) so

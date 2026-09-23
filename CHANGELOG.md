@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the active model being `zai` — nothing fires for Cortecs/Anthropic/etc.
   A missing `zai.key` disables the watcher gracefully.
 
+### Fixed
+
+- Pi session pointer is now scoped to the resolved `workdir` (work doc #4):
+  pointers live at `dataDir/sessions/<sha256(workdir)[:16]>.json` so
+  distinct repos keep distinct sessions. Previously the single
+  `dataDir/session` file was shared across every repo, so starting the
+  daemon in a different cwd resumed the previous repo's conversation.
+  One-time migration: the legacy `dataDir/session` is adopted for the
+  first workdir that reads it, then removed. Foundational to the
+  multi-repo `/cd` work (doc #2).
+
 - Initial implementation of the `pi-lxmf` bridge: an LXMF ↔ Pi RPC daemon per
   `SPEC.md`.
   - `PiRpcClient` (`src/rpc.js`): spawns and supervises `pi --mode rpc`,

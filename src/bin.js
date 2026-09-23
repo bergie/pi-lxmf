@@ -109,6 +109,7 @@ function gracefulShutdown(reason, parts) {
             if (state?.sessionFile) {
               writeSessionPointer(
                 parts.config?.dataDir ?? "",
+                parts.config?.workdir ?? "",
                 state.sessionFile,
               );
             }
@@ -157,7 +158,7 @@ async function main() {
 
   bannerLine("owner (identity)", config.owner);
 
-  const sessionPointer = readSessionPointer(config.dataDir);
+  const sessionPointer = readSessionPointer(config.dataDir, config.workdir);
   if (sessionPointer) {
     bannerLine("resume", basename(sessionPointer.sessionFile));
   }
@@ -181,8 +182,9 @@ async function main() {
     rpc,
     mesh,
     state: {
-      loadSession: () => readSessionPointer(config.dataDir),
-      saveSession: (file) => writeSessionPointer(config.dataDir, file),
+      loadSession: () => readSessionPointer(config.dataDir, config.workdir),
+      saveSession: (file) =>
+        writeSessionPointer(config.dataDir, config.workdir, file),
     },
     quotaWatcher: new GlmQuotaWatcher({
       ownerDestinationHash: deriveLxmfDestinationHash(config.owner),

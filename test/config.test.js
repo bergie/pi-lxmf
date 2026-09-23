@@ -4,7 +4,15 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -17,6 +25,12 @@ import {
   readSessionPointer,
   writeSessionPointer,
 } from "../src/config.js";
+
+/** First 16 hex chars of SHA-256(workdir), matching config.js's keying.
+ * @param {string} s
+ */
+const sha256Hex16 = (s) =>
+  createHash("sha256").update(s).digest("hex").slice(0, 16);
 
 /**
  * @param {Record<string, unknown>} [raw]
@@ -163,20 +177,58 @@ test("skipSharedInstance defaults to false and rejects non-booleans", async () =
   );
 });
 
-test("session pointer round-trip and corrupt tolerance", () => {
+test("session pointer is scoped to workdir with one-time legacy migration", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-lxmf-state-"));
+  const workdirA = join(dir, "repo-a");
+  const workdirB = join(dir, "repo-b");
   try {
-    assert.equal(readSessionPointer(dir), null);
-    writeSessionPointer(dir, "/sessions/abc.jsonl");
-    assert.deepEqual(readSessionPointer(dir), {
+    // No pointer for a fresh workdir (and no legacy file) → empty.
+    assert.equal(readSessionPointer(dir, workdirA), null);
+
+    // Legacy single-file pointer: first read for ANY workdir adopts it,
+    // then removes the legacy file so adoption runs exactly once.
+    writeFileSync(
+      join(dir, "session"),
+      '{"sessionFile":"/sessions/legacy.jsonl"}',
+    );
+    assert.deepEqual(readSessionPointer(dir, workdirA), {
+      sessionFile: "/sessions/legacy.jsonl",
+    });
+    assert.equal(existsSync(join(dir, "session")), false);
+    // A second read finds the migrated pointer.
+    assert.deepEqual(readSessionPointer(dir, workdirA), {
+      sessionFile: "/sessions/legacy.jsonl",
+    });
+
+    // write/read round-trip for workdirA.
+    writeSessionPointer(dir, workdirA, "/sessions/abc.jsonl");
+    assert.deepEqual(readSessionPointer(dir, workdirA), {
       sessionFile: "/sessions/abc.jsonl",
     });
-    // Corrupt state reads as null instead of throwing.
-    writeFileSync(join(dir, "session"), "{broken");
-    assert.equal(readSessionPointer(dir), null);
+
+    // A different workdir has its OWN pointer (empty until written).
+    assert.equal(readSessionPointer(dir, workdirB), null);
+    writeSessionPointer(dir, workdirB, "/sessions/def.jsonl");
+    assert.deepEqual(readSessionPointer(dir, workdirB), {
+      sessionFile: "/sessions/def.jsonl",
+    });
+    // workdirA is untouched by workdirB's write.
+    assert.deepEqual(readSessionPointer(dir, workdirA), {
+      sessionFile: "/sessions/abc.jsonl",
+    });
+
+    // Corrupt per-workdir state reads as null instead of throwing.
+    const aPath = join(dir, "sessions", `${sha256Hex16(workdirA)}.json`);
+    writeFileSync(aPath, "{broken");
+    assert.equal(readSessionPointer(dir, workdirA), null);
+    // workdirB is unaffected.
+    assert.deepEqual(readSessionPointer(dir, workdirB), {
+      sessionFile: "/sessions/def.jsonl",
+    });
+
     // A dataDir that does not exist yet is fine.
     mkdirSync(join(dir, "nested"));
-    assert.equal(readSessionPointer(join(dir, "nested")), null);
+    assert.equal(readSessionPointer(join(dir, "nested"), workdirA), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
