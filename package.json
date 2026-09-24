@@ -1,6 +1,6 @@
 {
   "name": "pi-lxmf",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drive the Pi coding agent over LXMF messaging (Reticulum mesh) from a headless server.",
   "license": "EUPL-1.2",
   "author": "Henri Bergius <henri.bergius@iki.fi>",
