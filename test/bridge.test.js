@@ -606,6 +606,45 @@ test("failed LXMF delivery is noted on the next message", async () => {
   assert.match(mesh.sent[0].text, /reply two/);
 });
 
+test("startup notification tells the owner the bridge is ready", async () => {
+  const { bridge, mesh } = makeBridge({ owner: OWNER });
+  await bridge.notifyStartup();
+  assert.equal(mesh.sent.length, 1);
+  assert.equal(mesh.sent[0].destinationHex, OWNER_DEST);
+  assert.match(mesh.sent[0].text, /pi-lxmf ready — listening for messages/);
+  assert.doesNotMatch(mesh.sent[0].text, /Resuming session/);
+  // No inbound link exists at startup: fresh DIRECT delivery.
+  assert.equal(mesh.sent[0].options.link, undefined);
+  assert.equal(mesh.sent[0].options.title, "test-node");
+});
+
+test("startup notification includes the resumed session", async () => {
+  const { bridge, mesh } = makeBridge({ owner: OWNER });
+  await bridge.notifyStartup("/sessions/2026-09-24-work.jsonl");
+  assert.match(lastSent(mesh), /Resuming session 2026-09-24-work\.jsonl/);
+});
+
+test("startup notification delivery failure is noted, not fatal", async () => {
+  const { bridge, mesh } = makeBridge({ owner: OWNER });
+  const realSend = mesh.sendText.bind(mesh);
+  let failNext = true;
+  mesh.sendText = async (destinationHex, text, options) => {
+    if (failNext) {
+      failNext = false;
+      throw new Error("no path");
+    }
+    return realSend(destinationHex, text, options);
+  };
+  await bridge.notifyStartup(); // must not throw
+  assert.equal(mesh.sent.length, 0); // delivery failed, noted
+
+  // The failure note rides along on the next successful delivery.
+  await bridge.deliver("later reply");
+  assert.equal(mesh.sent.length, 1);
+  assert.match(mesh.sent[0].text, /could not be delivered/);
+  assert.match(mesh.sent[0].text, /later reply/);
+});
+
 test("events arriving in the same chunk as the prompt response are not lost", async () => {
   const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
   // Simulate pi emitting the acceptance response and the entire run's

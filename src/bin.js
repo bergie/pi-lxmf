@@ -210,6 +210,10 @@ async function main() {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+  // The daemon is fully available: tell the owner (they may be waiting on
+  // a restart). Delivery failures are noted, not fatal.
+  await bridge.notifyStartup(sessionPointer?.sessionFile ?? null);
+
   // Run until signalled or shut down over LXMF.
   await new Promise(() => {});
 }

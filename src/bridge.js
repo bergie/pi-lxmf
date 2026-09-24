@@ -13,6 +13,7 @@
  * before falling back to a "done (no reply)" nudge.
  */
 
+import { basename } from "node:path";
 import {
   bridgeCommands,
   EMPTY_REPLY_RECOVERY_PROMPT,
@@ -552,6 +553,23 @@ export class Bridge {
       this.failedNote = `[previous reply could not be delivered: ${errorText(e)}]`;
       this.log.error(`pi-lxmf: LXMF delivery failed: ${errorText(e)}`);
     }
+  }
+
+  /**
+   * Tells the owner the bridge has started and is accepting messages
+   * (the startup case of SPEC §13 proactive notifications). Called by the
+   * daemon once the mesh side is announcing and the RPC child is ready.
+   * Best-effort via {@link deliver}: a failure is noted and carried by
+   * the next successful delivery instead of being lost.
+   *
+   * @param {string|null} [resumedSessionFile] - Absolute path of the
+   *   session resumed from the persisted pointer, when one exists.
+   */
+  async notifyStartup(resumedSessionFile = null) {
+    const resumed = resumedSessionFile
+      ? `\nResuming session ${basename(resumedSessionFile)}.`
+      : "";
+    await this.deliver(`🟢 pi-lxmf ready — listening for messages.${resumed}`);
   }
 
   /**
