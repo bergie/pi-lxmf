@@ -8,11 +8,16 @@
  * signalled or told to quit over LXMF.
  */
 
+import { statSync } from "node:fs";
 import { basename } from "node:path";
 import { Bridge } from "./bridge.js";
+import { isUnderWorkdir } from "./commands.js";
 import {
+  listSessionPointers,
   loadConfig,
+  readActiveCwd,
   readSessionPointer,
+  writeActiveCwd,
   writeSessionPointer,
 } from "./config.js";
 import { deriveLxmfDestinationHash } from "./identity.js";
@@ -99,8 +104,9 @@ function gracefulShutdown(reason, parts) {
     parts.mesh?.stop();
     process.exit(0);
   };
-  // Best effort: persist the current session pointer so the next start
-  // resumes this session.
+  // Best effort: persist the current session pointer (under the repo the
+  // supervised Pi currently runs in — it may have moved via /cd) so the
+  // next start resumes this session.
   const persist =
     parts.bridge && parts.rpc && parts.config
       ? parts.rpc
@@ -109,7 +115,7 @@ function gracefulShutdown(reason, parts) {
             if (state?.sessionFile) {
               writeSessionPointer(
                 parts.config?.dataDir ?? "",
-                parts.config?.workdir ?? "",
+                parts.rpc?.cwd ?? parts.config?.workdir ?? "",
                 state.sessionFile,
               );
             }
@@ -158,7 +164,34 @@ async function main() {
 
   bannerLine("owner (identity)", config.owner);
 
-  const sessionPointer = readSessionPointer(config.dataDir, config.workdir);
+  // The last repo the owner /cd'ed into, if it is still usable: under the
+  // daemon workdir (the trust root) and still an existing directory.
+  // Otherwise fall back to the workdir itself.
+  /** @type {string} */
+  let startCwd = config.workdir;
+  const persistedCwd = readActiveCwd(config.dataDir);
+  if (persistedCwd && persistedCwd !== config.workdir) {
+    let usable = isUnderWorkdir(config.workdir, persistedCwd);
+    if (usable) {
+      try {
+        usable = statSync(persistedCwd).isDirectory();
+      } catch {
+        usable = false;
+      }
+    }
+    if (usable) {
+      startCwd = persistedCwd;
+    } else {
+      console.log(
+        `pi-lxmf: persisted cwd ${persistedCwd} is no longer under workdir — starting in workdir`,
+      );
+    }
+  }
+  if (startCwd !== config.workdir) {
+    bannerLine("cwd", startCwd);
+  }
+
+  const sessionPointer = readSessionPointer(config.dataDir, startCwd);
   if (sessionPointer) {
     bannerLine("resume", basename(sessionPointer.sessionFile));
   }
@@ -173,7 +206,7 @@ async function main() {
   rpc = new PiRpcClient({
     piBin: config.piBin,
     model: config.model,
-    cwd: config.workdir,
+    cwd: startCwd,
     sessionPath: sessionPointer?.sessionFile ?? null,
   });
 
@@ -182,9 +215,11 @@ async function main() {
     rpc,
     mesh,
     state: {
-      loadSession: () => readSessionPointer(config.dataDir, config.workdir),
-      saveSession: (file) =>
-        writeSessionPointer(config.dataDir, config.workdir, file),
+      loadSession: (workdir) => readSessionPointer(config.dataDir, workdir),
+      saveSession: (workdir, file) =>
+        writeSessionPointer(config.dataDir, workdir, file),
+      saveCwd: (cwd) => writeActiveCwd(config.dataDir, cwd),
+      listSessions: () => listSessionPointers(config.dataDir),
     },
     quotaWatcher: new GlmQuotaWatcher({
       ownerDestinationHash: deriveLxmfDestinationHash(config.owner),

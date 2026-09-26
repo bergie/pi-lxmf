@@ -8,8 +8,51 @@
  * text (or a `{ text, shutdown }` action).
  */
 
-import { basename } from "node:path";
+import { statSync } from "node:fs";
+import { basename, relative, resolve, sep } from "node:path";
 import { formatDuration, formatTokens } from "./text.js";
+
+/**
+ * Whether `candidate` is the workdir itself or nested beneath it
+ * (normalized absolute paths). The multi-repo trust boundary: everything
+ * `/cd`-switchable must stay under the daemon's start folder.
+ *
+ * @param {string} workdir - The daemon's configured workdir (trust root).
+ * @param {string} candidate - Absolute path to check.
+ * @returns {boolean}
+ */
+export function isUnderWorkdir(workdir, candidate) {
+  const root = resolve(workdir);
+  const abs = resolve(candidate);
+  return abs === root || abs.startsWith(`${root}${sep}`);
+}
+
+/**
+ * Resolves a `/cd` target to an absolute directory under `workdir` — the
+ * single choke point for the multi-repo boundary (also applied to the
+ * persisted active cwd at daemon startup, so a future DACAR per-subtree
+ * identity check can sit in the same place). `target` is resolved against
+ * `workdir`; anything that escapes the tree (`..` traversal, absolute
+ * paths outside it), does not exist, or is not a directory is refused
+ * with `null`.
+ *
+ * @param {string} workdir - The daemon's configured workdir (trust root).
+ * @param {string} target - User-supplied path (relative to workdir or absolute).
+ * @param {(path: string) => {isDirectory: () => boolean}} [statFn] - Injectable for tests.
+ * @returns {string|null} The validated absolute path, or `null` when refused.
+ */
+export function resolveCwdTarget(workdir, target, statFn = statSync) {
+  const trimmed = (target ?? "").trim();
+  if (!trimmed) return null;
+  const abs = resolve(workdir, trimmed);
+  if (!isUnderWorkdir(workdir, abs)) return null;
+  try {
+    if (!statFn(abs).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return abs;
+}
 
 /**
  * Parses bridge-command syntax out of a chat message.
@@ -83,6 +126,8 @@ export function formatModelList(models, current) {
  * @param {string} bridgeInfo.deliveryHash - This node's `lxmf.delivery` destination hash.
  * @param {string|null} bridgeInfo.owner - Paired owner hash.
  * @param {number} bridgeInfo.uptimeMs
+ * @param {string} [bridgeInfo.workdir] - The daemon's configured workdir.
+ * @param {string|null} [bridgeInfo.cwd] - The repo the supervised Pi currently runs in.
  * @returns {string}
  */
 export function formatStatus(state, bridgeInfo) {
@@ -97,11 +142,37 @@ export function formatStatus(state, bridgeInfo) {
     `thinking: ${state?.thinkingLevel ?? "off"}`,
     `busy: ${state?.isStreaming ? "yes" : "no"}`,
     `session: ${session}`,
+    `cwd: ${bridgeInfo.cwd ?? "?"}`,
+    `workdir: ${bridgeInfo.workdir ?? "?"}`,
     `node: ${bridgeInfo.identityHash}`,
     `lxmf: ${bridgeInfo.deliveryHash}`,
     `owner (identity): ${bridgeInfo.owner ?? "?"}`,
     `uptime: ${formatDuration(bridgeInfo.uptimeMs)}`,
   ].join("\n");
+}
+
+/**
+ * Formats the `/cd` (no arguments) reply: the current repo and the
+ * recently used repos under the daemon workdir.
+ *
+ * @param {object} bridgeInfo
+ * @param {string} bridgeInfo.workdir
+ * @param {string|null} [bridgeInfo.cwd]
+ * @param {string[]} [bridgeInfo.recentWorkdirs]
+ * @returns {string}
+ */
+export function formatRepoList(bridgeInfo) {
+  const workdir = bridgeInfo.workdir;
+  const cwd = bridgeInfo.cwd ?? workdir;
+  const lines = [`cwd: ${relative(workdir, cwd) || "."} (${cwd})`];
+  const recent = bridgeInfo.recentWorkdirs ?? [];
+  if (recent.length === 0) {
+    lines.push("recent: (none)");
+  } else {
+    lines.push("recent:");
+    for (const w of recent) lines.push(`  ${relative(workdir, w) || "."}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -123,8 +194,11 @@ export function formatSessionStats(stats) {
 /**
  * @typedef {object} CommandContext
  * @property {import("./rpc.js").PiRpcClient} rpc
+ * @property {string} workdir - The daemon's configured workdir (trust root for `/cd`).
+ * @property {(absPath: string) => Promise<string>} changeWorkdir - Switch the supervised Pi into a validated repo; resolves to the reply text.
  * @property {() => string} getTitle - Reply title (session name or node name).
- * @property {() => {identityHash: string, deliveryHash: string, owner: string, uptimeMs: number}} getBridgeInfo
+ * @property {() => {identityHash: string, deliveryHash: string, owner: string, uptimeMs: number, workdir: string, cwd: string|null, recentWorkdirs: string[]}} getBridgeInfo
+ * @property {(msg: string) => void} [log] - Diagnostic sink for refusals.
  */
 
 /**
@@ -190,6 +264,22 @@ export const bridgeCommands = {
       const data = await ctx.rpc.newSession();
       if (data?.cancelled) return "New session was cancelled by an extension.";
       return "New session started.";
+    },
+  },
+
+  cd: {
+    description: "Switch repo: /cd <path under workdir>, or list repos",
+    async run(ctx, args) {
+      if (!args) return formatRepoList(ctx.getBridgeInfo());
+      const target = resolveCwdTarget(ctx.workdir, args);
+      if (!target) {
+        ctx.log?.(`pi-lxmf: /cd refused: ${args} not under workdir`);
+        return `⚠️ /cd refused: "${args}" is not a directory under ${ctx.workdir}.`;
+      }
+      if (target === ctx.getBridgeInfo().cwd) {
+        return `Already in ${target}.`;
+      }
+      return ctx.changeWorkdir(target);
     },
   },
 

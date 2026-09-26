@@ -5,6 +5,9 @@
  */
 
 import { strict as assert } from "node:assert";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Bridge } from "../src/bridge.js";
@@ -56,6 +59,10 @@ class FakeRpc extends EventTarget {
     /** @type {Array<[string, ...any[]]>} */
     this.calls = [];
     this.sessionPath = null;
+    /** The repo the supervised Pi currently runs in (mirrors PiRpcClient.cwd). */
+    this.cwd = "/workspace";
+    /** @type {string[]} */
+    this.cwdSwitches = [];
   }
 
   /**
@@ -162,6 +169,20 @@ class FakeRpc extends EventTarget {
     this.sessionPath = path;
   }
 
+  /**
+   * Mirrors PiRpcClient.setCwd: records the switch, moves the fake cwd,
+   * and notifies listeners the old child is going away.
+   *
+   * @param {string} absPath
+   */
+  async setCwd(absPath) {
+    this.cwdSwitches.push(absPath);
+    this.cwd = absPath;
+    this.dispatchEvent(
+      new CustomEvent("switching", { detail: { cwd: absPath } }),
+    );
+  }
+
   /** @param {any} event */
   emitEvent(event) {
     this.dispatchEvent(new CustomEvent("event", { detail: event }));
@@ -233,6 +254,13 @@ class FakeState {
     this.owner = null;
     /** @type {string|null} */
     this.session = null;
+    /** Workdir → session file (the per-repo pointers). */
+    /** @type {Record<string, string>} */
+    this.sessions = {};
+    /** @type {string|null} */
+    this.savedCwd = null;
+    /** @type {Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>} */
+    this.sessionList = [];
   }
 
   loadOwner() {
@@ -246,15 +274,33 @@ class FakeState {
     this.owner = hash;
   }
 
-  loadSession() {
-    return this.session ? { sessionFile: this.session } : null;
+  /**
+   * @param {string} workdir
+   */
+  loadSession(workdir) {
+    return this.sessions[workdir]
+      ? { sessionFile: this.sessions[workdir] }
+      : null;
   }
 
   /**
+   * @param {string} workdir
    * @param {string} file
    */
-  saveSession(file) {
+  saveSession(workdir, file) {
     this.session = file;
+    this.sessions[workdir] = file;
+  }
+
+  /**
+   * @param {string} cwd
+   */
+  saveCwd(cwd) {
+    this.savedCwd = cwd;
+  }
+
+  listSessions() {
+    return this.sessionList;
   }
 }
 
@@ -262,6 +308,7 @@ class FakeState {
  * @param {object} [options]
  * @param {any} [options.config]
  * @param {string} [options.owner]
+ * @param {string} [options.workdir]
  * @param {import("../src/quota.js").GlmQuotaWatcher} [options.quotaWatcher]
  * @param {Function} [options.onShutdown]
  */
@@ -269,6 +316,8 @@ function makeBridge(options = {}) {
   const rpc = new FakeRpc();
   const mesh = new FakeMesh();
   const state = new FakeState();
+  const workdir = options.workdir ?? "/workspace";
+  rpc.cwd = workdir;
   /** @type {string[]} */
   const shutdowns = [];
   const bridge = new Bridge({
@@ -277,6 +326,7 @@ function makeBridge(options = {}) {
       chunkChars: 2500,
       name: "test-node",
       owner: options.owner ?? OWNER,
+      workdir,
       ...options.config,
     },
     rpc: /** @type {any} */ (rpc),
@@ -560,6 +610,167 @@ test("command failures are reported, not thrown", async () => {
   mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/status" });
   await bridge.queue;
   assert.match(lastSent(mesh), /\/status failed: state unavailable/);
+});
+
+test("/cd switches the supervised Pi into another repo and resumes its session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-lxmf-cd-"));
+  const repoB = join(root, "repo-b");
+  mkdirSync(repoB);
+  try {
+    const { bridge, rpc, mesh, state } = makeBridge({
+      owner: OWNER,
+      workdir: root,
+    });
+    // repo-b was visited before: it has a session pointer.
+    state.sessions[repoB] = "/sessions/repo-b.jsonl";
+    rpc.states.push({
+      isStreaming: false,
+      sessionName: "repo-b-work",
+      sessionFile: "/sessions/repo-b.jsonl",
+    });
+
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd repo-b" });
+    await bridge.queue;
+
+    assert.deepEqual(rpc.cwdSwitches, [repoB]);
+    assert.equal(rpc.sessionPath, "/sessions/repo-b.jsonl");
+    assert.equal(bridge.currentCwd, repoB);
+    assert.equal(state.savedCwd, repoB);
+    assert.match(lastSent(mesh), /Switched to repo-b./);
+    assert.match(lastSent(mesh), /Resuming session repo-b\.jsonl/);
+    // The resumed session observation persists under ITS workdir key.
+    assert.equal(state.sessions[repoB], "/sessions/repo-b.jsonl");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/cd into a repo without a pointer starts a fresh session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-lxmf-cd-"));
+  const repoC = join(root, "repo-c");
+  mkdirSync(repoC);
+  try {
+    const { bridge, rpc, mesh, state } = makeBridge({
+      owner: OWNER,
+      workdir: root,
+    });
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd repo-c" });
+    await bridge.queue;
+
+    assert.deepEqual(rpc.cwdSwitches, [repoC]);
+    assert.equal(rpc.sessionPath, "/sessions/current.jsonl"); // the fresh session observed after the switch
+    assert.equal(state.savedCwd, repoC);
+    assert.match(lastSent(mesh), /Switched to repo-c\./);
+    assert.match(lastSent(mesh), /Fresh session\./);
+    // The fresh session (reported by get_state) persists under repo-c's key.
+    assert.equal(state.sessions[repoC], "/sessions/current.jsonl");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/cd refuses paths outside the workdir without touching the child", async () => {
+  const { bridge, rpc, mesh, state } = makeBridge({ owner: OWNER });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd ../elsewhere" });
+  await bridge.queue;
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "/cd /etc",
+  });
+  await bridge.queue;
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd missing-dir" });
+  await bridge.queue;
+
+  assert.deepEqual(rpc.cwdSwitches, []);
+  assert.equal(rpc.sessionPath, null); // refusals never touch the child
+  assert.equal(state.savedCwd, null);
+  for (const sent of mesh.sent) {
+    assert.match(sent.text, /not a directory under \/workspace/);
+  }
+});
+
+test("/cd to the current repo is a friendly no-op", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-lxmf-cd-"));
+  try {
+    const { bridge, rpc, mesh } = makeBridge({ owner: OWNER, workdir: root });
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd ." });
+    await bridge.queue;
+    assert.deepEqual(rpc.cwdSwitches, []);
+    assert.match(lastSent(mesh), new RegExp(`Already in ${root}.`));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/cd without arguments lists the current and recent repos", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-lxmf-cd-"));
+  const repoB = join(root, "repo-b");
+  mkdirSync(repoB);
+  try {
+    const { bridge, rpc, mesh, state } = makeBridge({
+      owner: OWNER,
+      workdir: root,
+    });
+    state.sessionList = [
+      { workdir: repoB, sessionFile: "/sessions/b.jsonl", mtimeMs: 2 },
+      { workdir: "/somewhere/else", sessionFile: "/x.jsonl", mtimeMs: 1 },
+      { workdir: null, sessionFile: "/legacy.jsonl", mtimeMs: 0 },
+    ];
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd" });
+    await bridge.queue;
+
+    assert.deepEqual(rpc.cwdSwitches, []);
+    const text = lastSent(mesh);
+    assert.ok(
+      text.startsWith(`cwd: . (${root})\n`),
+      `unexpected repo list: ${text}`,
+    );
+    assert.match(text, /recent:/);
+    assert.match(text, /repo-b/);
+    assert.doesNotMatch(text, /somewhere/);
+    assert.doesNotMatch(text, /legacy/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/cd mid-run closes the exchange without empty-tail recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-lxmf-cd-"));
+  const repoB = join(root, "repo-b");
+  mkdirSync(repoB);
+  try {
+    const { bridge, rpc, mesh } = makeBridge({
+      owner: OWNER,
+      workdir: root,
+    });
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "long task" });
+    await bridge.queue;
+    rpc.emitEvent({ type: "agent_start" });
+    assert.equal(bridge.exchangeActive, true);
+
+    // Switch mid-run: the killed child's run will never settle.
+    mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd repo-b" });
+    await bridge.queue;
+    assert.equal(bridge.exchangeActive, false);
+    assert.equal(bridge.busy, false);
+
+    // A later settle (from the fresh session's runs) must not fire the
+    // empty-tail recovery for the killed run.
+    rpc.emitEvent({ type: "agent_settled" });
+    await sleep(10);
+    assert.equal(rpc.prompts.length, 1); // just the original prompt
+    assert.match(lastSent(mesh), /Switched to repo-b\./);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/status shows the current cwd and workdir", async () => {
+  const { bridge, mesh } = makeBridge({ owner: OWNER });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/status" });
+  await bridge.queue;
+  assert.match(lastSent(mesh), /cwd: \/workspace/);
+  assert.match(lastSent(mesh), /workdir: \/workspace/);
 });
 
 test("failed LXMF delivery is noted on the next message", async () => {

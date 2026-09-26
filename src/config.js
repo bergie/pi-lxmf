@@ -19,8 +19,10 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -368,7 +370,7 @@ export function readSessionPointer(dataDir, workdir) {
   const legacyPath = join(dataDir, LEGACY_SESSION_FILE);
   const legacy = readStateFile(legacyPath);
   if (legacy?.sessionFile && typeof legacy.sessionFile === "string") {
-    writeStateFile(path, { sessionFile: legacy.sessionFile });
+    writeStateFile(path, { workdir, sessionFile: legacy.sessionFile });
     try {
       rmSync(legacyPath, { force: true });
     } catch {
@@ -382,12 +384,82 @@ export function readSessionPointer(dataDir, workdir) {
 /**
  * Persists the Pi session pointer for `workdir` (the JSONL file `pi
  * --session` resumes), keyed by the workdir so distinct repos keep distinct
- * sessions.
+ * sessions. The workdir is stored alongside the pointer so the recently
+ * used repos can be listed for `/cd` (see {@link listSessionPointers}).
  *
  * @param {string} dataDir
  * @param {string} workdir - The resolved workdir the pointer is scoped to.
  * @param {string} sessionFile - Absolute path to the session file.
  */
 export function writeSessionPointer(dataDir, workdir, sessionFile) {
-  writeStateFile(sessionPointerPath(dataDir, workdir), { sessionFile });
+  writeStateFile(sessionPointerPath(dataDir, workdir), {
+    workdir,
+    sessionFile,
+  });
+}
+
+/**
+ * The persisted active cwd (the last repo the owner `/cd`'ed into).
+ */
+const ACTIVE_CWD_FILE = "cwd.json";
+
+/**
+ * Loads the persisted active cwd — the repo a daemon restart should resume
+ * in. Callers must revalidate it against the daemon workdir (still beneath
+ * it, still an existing directory) before use; `isUnderWorkdir` in
+ * `src/commands.js` is the shared boundary check.
+ *
+ * @param {string} dataDir
+ * @returns {string|null}
+ */
+export function readActiveCwd(dataDir) {
+  const state = readStateFile(join(dataDir, ACTIVE_CWD_FILE));
+  return typeof state?.cwd === "string" && state.cwd ? state.cwd : null;
+}
+
+/**
+ * Persists the active cwd so a daemon restart resumes in the last repo the
+ * owner switched into.
+ *
+ * @param {string} dataDir
+ * @param {string} cwd - Absolute path under the daemon workdir.
+ */
+export function writeActiveCwd(dataDir, cwd) {
+  writeStateFile(join(dataDir, ACTIVE_CWD_FILE), { cwd });
+}
+
+/**
+ * Lists the per-workdir session pointers, most recently modified first —
+ * the "recently used repos" shown by `/cd`. Entries written before the
+ * workdir was stored alongside the pointer report `workdir: null`.
+ *
+ * @param {string} dataDir
+ * @returns {Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>}
+ */
+export function listSessionPointers(dataDir) {
+  const dir = join(dataDir, SESSIONS_DIR);
+  if (!existsSync(dir)) return [];
+  /** @type {Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>} */
+  const out = [];
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith(".json")) continue;
+    const path = join(dir, entry);
+    const data = readStateFile(path);
+    if (!data || typeof data.sessionFile !== "string" || !data.sessionFile) {
+      continue;
+    }
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(path).mtimeMs;
+    } catch {
+      /* deleted between readdir and stat: entry is stale anyway */
+    }
+    out.push({
+      workdir: typeof data.workdir === "string" ? data.workdir : null,
+      sessionFile: data.sessionFile,
+      mtimeMs,
+    });
+  }
+  out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return out;
 }

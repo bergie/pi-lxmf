@@ -123,6 +123,9 @@ agent.
   respawns it after a short backoff, re-applies `--session` from the last
   persisted pointer, and notifies the owner over LXMF. Repeated crashes
   (e.g. 3 within a minute) stop the respawn loop and report to the owner.
+  A `/cd` switch (§6.6) respawns *deliberately* — the old child is killed,
+  the replacement spawned immediately (no backoff, no crash-loop counting)
+  in the new cwd, carrying `--model` and the target repo's session pointer.
 - **Shutdown:** SIGINT/SIGTERM or `/quit` → best-effort `get_state` to
   persist the session pointer, SIGINT to Pi (hard kill after 3 s), stop
   announcing, exit.
@@ -268,7 +271,41 @@ answered with `{"type":"extension_ui_response","id":…,"cancelled":true}`
 and the owner is informed: `⛔ dialog dismissed: <title>`. Fire-and-forget
 UI methods (`notify`, `setStatus`, `setWidget`, …) are ignored.
 
-### 6.5 z.ai GLM quota watcher and peak-hours warning
+### 6.6 Multi-repo: `/cd`
+
+One bridge can serve every repo under the daemon's start folder. `/cd
+<path>` switches the supervised Pi into another directory at runtime — a
+supervised respawn, not an in-process `chdir`: the child is killed (pending
+requests failed, any open exchange closed without empty-tail recovery —
+the killed run never settles), respawned with the new `cwd` (carrying
+`--model`; applying the target repo's per-workdir session pointer via
+`--session`, §8 — so revisiting a repo resumes its conversation and a new
+repo starts fresh), and probed until ready; inbound messages queue during
+the switch. Pi therefore discovers the new repo's `AGENTS.md`/`.pi` and
+re-evaluates project trust exactly as a manual restart would.
+
+**Boundary:** `/cd` accepts only paths that resolve under the daemon's
+`workdir` (the folder `pi-lxmf` was started under — the trust root for
+switchable repos). `..` traversal and absolute paths outside the tree, and
+missing or non-directory targets, are refused without ever touching the
+child. The path resolution in `resolveCwdTarget` (`src/commands.js`) is the
+single choke point — the same check is applied to the persisted active
+cwd at startup — so a future DACAR per-subtree identity check can sit in
+the same place: DACAR's per-folder ACLs may *narrow* which identities may
+enter a given subtree, and the daemon-wide `owner` must not `/cd` past
+such a restriction. When DACAR also brings per-ACL-group LXMF
+identities, `/cd` may evolve from "one child, switch cwd" to a pool of
+children keyed by (identity, repo); the command and its boundary stay
+valid under either model.
+
+The active cwd is persisted (`dataDir/cwd.json`, §8) and revalidated at
+startup (still under `workdir`, still an existing directory — otherwise
+fall back to `workdir`), so a daemon restart resumes in the last repo the
+owner switched into. `/cd` without arguments lists the current repo and
+the recently used ones (derived from the per-workdir session pointers);
+`/status` shows the current `cwd` and `workdir`.
+
+### 6.7 z.ai GLM quota watcher and peak-hours warning
 
 When the active model is a z.ai GLM model (`provider === "zai"`), the bridge
 runs a `GlmQuotaWatcher` (`src/quota.js`) that does two things, both gated
@@ -303,6 +340,7 @@ in one place so it can be retargeted per subtree.
 | `/status` | model, thinking level, busy state, session name/file, bridge uptime, node identity hashes | no |
 | `/session` | `get_session_stats` — message counts, tokens, cost, context usage | no |
 | `/new` | `new_session`, persist the new session pointer | no |
+| `/cd <path>` | switch the supervised Pi to another repo under `workdir` (supervised respawn, §6.6); without an argument, list the current and recent repos | no |
 | `/name [name]` | `set_session_name`, or show current name | no |
 | `/compact [instructions]` | `compact` (custom instructions appended) | summarizer only |
 | `/model [query]` | no arg: list models (`get_available_models`, current marked); with arg: fuzzy-match `provider/id` or name, then `set_model` | no |
@@ -342,7 +380,8 @@ JSON, `0600`, unknown keys rejected with a warning.
 - `storage/` — Reticulum persistence (identity, known destinations,
   ratchets) via `FileStorageAdapter`.
 - `sessions/<key>.json` — per-workdir Pi session pointers
-  (`{ "sessionFile": … }`), keyed by the first 16 hex chars of
+  (`{ "workdir": …, "sessionFile": … }` — the `workdir` field feeds the
+  `/cd` recent-repos list), keyed by the first 16 hex chars of
   `SHA-256(workdir)` so distinct repos keep distinct sessions (the session
   is the conversation; switching models mid-session keeps the same pointer).
   Written on `new_session`, on graceful shutdown, and whenever
@@ -351,6 +390,9 @@ JSON, `0600`, unknown keys rejected with a warning.
   missing/empty pointer starts a fresh session). One-time migration: a
   pre-scoping legacy `session` file is adopted for the first workdir that
   reads it, then removed, so the adoption runs exactly once.
+- `cwd.json` — the active cwd (`{ "cwd": … }`): the repo the owner last
+  `/cd`'ed into (§6.6). Revalidated at startup against the `workdir`
+  boundary and the filesystem; unusable values fall back to `workdir`.
 
 **Operational note:** Pi's project trust is not prompted for over LXMF.
 Operators run Pi interactively once in `workdir` (or preconfigure trust) so
@@ -462,7 +504,10 @@ an actual mesh is the remaining manual step.
   owner (pi-telegram's "connected companion projection").
 - **DACAR-based permissions** (../dacar): replace the single `owner`
   identity with grants/revocations synced over the mesh, keyed by identity
-  hash as v1 already is.
+  hash as v1 already is. Per-subtree ACLs will narrow which identities may
+  enter a given subtree — the `/cd` boundary (§6.6) is the choke point where
+  that check slots in — and per-ACL-group LXMF identities may turn the
+  single supervised child into a pool keyed by (identity, repo).
 - **Multiple owners.**
 - **`/export` → LXMF attachment** of the rendered HTML session.
 - **Propagation-node role** for the bridge itself, serving its owner's

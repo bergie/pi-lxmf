@@ -9,7 +9,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -21,8 +20,11 @@ import {
   ConfigError,
   defaultConfigPath,
   defaultDataDir,
+  listSessionPointers,
   loadConfig,
+  readActiveCwd,
   readSessionPointer,
+  writeActiveCwd,
   writeSessionPointer,
 } from "../src/config.js";
 
@@ -175,6 +177,61 @@ test("skipSharedInstance defaults to false and rejects non-booleans", async () =
     }),
     /skipSharedInstance.*boolean/,
   );
+});
+
+test("active cwd persistence round-trips and tolerates corruption", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-lxmf-state-"));
+  try {
+    assert.equal(readActiveCwd(dir), null);
+    writeActiveCwd(dir, "/w/repo-b");
+    assert.equal(readActiveCwd(dir), "/w/repo-b");
+    writeActiveCwd(dir, "/w/repo-c");
+    assert.equal(readActiveCwd(dir), "/w/repo-c");
+    // Corrupt state reads as null instead of throwing.
+    writeFileSync(join(dir, "cwd.json"), "{broken");
+    assert.equal(readActiveCwd(dir), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listSessionPointers returns recent repos, newest first", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-lxmf-state-"));
+  const sleep = (/** @type {number} */ ms) =>
+    new Promise((r) => setTimeout(r, ms));
+  try {
+    assert.deepEqual(listSessionPointers(dir), []); // no sessions dir yet
+    writeSessionPointer(dir, "/w/a", "/sessions/a.jsonl");
+    assert.deepEqual(listSessionPointers(join(dir, "missing")), []);
+    writeSessionPointer(dir, "/w/b", "/sessions/b.jsonl");
+
+    // Pointers record their workdir (for the /cd recent list).
+    let list = listSessionPointers(dir);
+    assert.equal(list.length, 2);
+    const byWorkdir = Object.fromEntries(list.map((s) => [s.workdir, s]));
+    assert.equal(byWorkdir["/w/a"].sessionFile, "/sessions/a.jsonl");
+    assert.equal(byWorkdir["/w/b"].sessionFile, "/sessions/b.jsonl");
+
+    // Rewriting a's pointer makes it the most recently used.
+    await sleep(10);
+    writeSessionPointer(dir, "/w/a", "/sessions/a2.jsonl");
+    list = listSessionPointers(dir);
+    assert.equal(list[0].workdir, "/w/a");
+    assert.equal(list[0].sessionFile, "/sessions/a2.jsonl");
+
+    // A pre-workdir-field pointer lists with workdir null (skipped by /cd).
+    const legacyPath = join(
+      dir,
+      "sessions",
+      `${sha256Hex16("/w/legacy")}.json`,
+    );
+    writeFileSync(legacyPath, '{"sessionFile":"/sessions/legacy.jsonl"}');
+    list = listSessionPointers(dir);
+    assert.equal(list.length, 3);
+    assert.ok(list.some((s) => s.workdir === null));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("session pointer is scoped to workdir with one-time legacy migration", () => {

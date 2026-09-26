@@ -13,10 +13,11 @@
  * before falling back to a "done (no reply)" nudge.
  */
 
-import { basename } from "node:path";
+import { basename, relative } from "node:path";
 import {
   bridgeCommands,
   EMPTY_REPLY_RECOVERY_PROMPT,
+  isUnderWorkdir,
   parseCommand,
 } from "./commands.js";
 import { deriveLxmfDestinationHash } from "./identity.js";
@@ -41,11 +42,14 @@ const REACTION_DEBOUNCE_MS = 2000;
  */
 
 /**
- * Machine-managed state persistence (session pointer).
+ * Machine-managed state persistence (per-workdir session pointers, the
+ * active cwd).
  *
  * @typedef {object} BridgeState
- * @property {() => {sessionFile: string}|null} loadSession
- * @property {(file: string) => void} saveSession
+ * @property {(workdir: string) => {sessionFile: string}|null} loadSession
+ * @property {(workdir: string, file: string) => void} saveSession
+ * @property {(cwd: string) => void} [saveCwd] - Persist the active cwd (the `/cd` target).
+ * @property {() => Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>} [listSessions] - Per-workdir pointers, recent first.
  */
 
 /**
@@ -99,6 +103,8 @@ export class Bridge {
     this.ownerIdentity = options.config.owner;
     /** The owner's derived lxmf.delivery destination hash (wire form). */
     this.ownerDestinationHash = deriveLxmfDestinationHash(options.config.owner);
+    /** The repo the supervised Pi currently runs in (moves via `/cd`). */
+    this.currentCwd = options.rpc?.cwd || options.config.workdir || null;
     /** @type {string|null} */
     this.sessionName = null;
     /** @type {string|null} */
@@ -159,6 +165,16 @@ export class Bridge {
       void this.deliver(
         `⚠️ pi exited unexpectedly (code ${code ?? "?"} signal ${signal ?? "?"}) — restarting…`,
       );
+    });
+    this.rpc.addEventListener("switching", () => {
+      // A `/cd` respawn begins: the old child is about to be killed and its
+      // run will never settle — close any open exchange (without recovery)
+      // and stop considering the client ready until the replacement answers.
+      this.setRpcReady(false);
+      this.clearReaction();
+      this.busy = false;
+      this.exchangeActive = false;
+      this.sentThisExchange = 0;
     });
     this.rpc.addEventListener("dead", (/** @type {any} */ event) => {
       this.setRpcReady(false);
@@ -497,10 +513,12 @@ export class Bridge {
     const file = state.sessionFile;
     if (typeof file === "string" && file && file !== this.lastSessionFile) {
       this.lastSessionFile = file;
-      try {
-        this.state.saveSession(file);
-      } catch (e) {
-        this.log.error(`pi-lxmf: could not persist session pointer: ${e}`);
+      if (this.currentCwd) {
+        try {
+          this.state.saveSession(this.currentCwd, file);
+        } catch (e) {
+          this.log.error(`pi-lxmf: could not persist session pointer: ${e}`);
+        }
       }
       this.rpc.setSessionPath(file);
     }
@@ -518,14 +536,85 @@ export class Bridge {
   commandContext() {
     return {
       rpc: this.rpc,
+      workdir: this.config.workdir,
+      /** @param {string} absPath */
+      changeWorkdir: (absPath) => this.changeWorkdir(absPath),
+      /** @param {string} msg */
+      log: (msg) => this.log.log(msg),
       getTitle: () => this.replyTitle(),
       getBridgeInfo: () => ({
         identityHash: this.mesh.identityHash,
         deliveryHash: this.mesh.deliveryHash,
         owner: this.ownerIdentity,
         uptimeMs: Date.now() - this.startedAt,
+        workdir: this.config.workdir,
+        cwd: this.currentCwd,
+        recentWorkdirs: this.recentWorkdirs(),
       }),
     };
+  }
+
+  /**
+   * Recently used repos under the daemon workdir (most recent first,
+   * excluding the current one), derived from the per-workdir session
+   * pointers. Best-effort: unreadable state lists as empty.
+   *
+   * @returns {string[]}
+   */
+  recentWorkdirs() {
+    if (!this.currentCwd || typeof this.state.listSessions !== "function") {
+      return [];
+    }
+    /** @type {string[]} */
+    const out = [];
+    try {
+      for (const entry of this.state.listSessions()) {
+        if (typeof entry.workdir !== "string") continue;
+        if (entry.workdir === this.currentCwd) continue;
+        if (!isUnderWorkdir(this.config.workdir, entry.workdir)) continue;
+        out.push(entry.workdir);
+      }
+    } catch {
+      return [];
+    }
+    return out;
+  }
+
+  /**
+   * Switches the supervised Pi into another repo under the daemon workdir
+   * (the `/cd` command): resumes the target repo's session pointer (when
+   * one exists — the per-workdir keying of SPEC §8), respawns the child
+   * there via `rpc.setCwd()`, persists the active cwd, and returns the
+   * reply text. `absPath` must already be validated (`resolveCwdTarget`).
+   *
+   * @param {string} absPath - Absolute directory under `config.workdir`.
+   * @returns {Promise<string>} Reply text for the owner.
+   */
+  async changeWorkdir(absPath) {
+    const pointer = this.state.loadSession(absPath);
+    // Session observations from the previous repo are stale: reset before
+    // the respawn so observeState() persists the new session under the
+    // new workdir's key.
+    this.sessionName = null;
+    this.lastSessionFile = pointer?.sessionFile ?? null;
+    this.rpc.setSessionPath(pointer?.sessionFile ?? null);
+    this.currentCwd = absPath;
+    try {
+      this.state.saveCwd?.(absPath);
+    } catch (e) {
+      this.log.error(`pi-lxmf: could not persist active cwd: ${e}`);
+    }
+    await this.rpc.setCwd(absPath);
+    // Observe (and persist) the new repo's session — resumed or fresh.
+    try {
+      this.observeState(await this.rpc.getState());
+    } catch {
+      /* switch reply still goes out; the next prompt re-observes */
+    }
+    const rel = relative(this.config.workdir, absPath) || ".";
+    return pointer
+      ? `Switched to ${rel}. Resuming session ${basename(pointer.sessionFile)}.`
+      : `Switched to ${rel}. Fresh session.`;
   }
 
   /**

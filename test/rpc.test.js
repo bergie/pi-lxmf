@@ -304,3 +304,106 @@ test("start fails when pi never becomes ready", async () => {
   await assert.rejects(client.start({ readyTimeoutMs: 300 }), RpcError);
   client.stop();
 });
+
+test("setCwd respawns the child in the new cwd, carrying model and session", async () => {
+  /** @type {{child: FakeChild, options: any}[]} */
+  const spawns = [];
+  let current = new FakeChild();
+  const client = new PiRpcClient({
+    model: "anthropic/x",
+    cwd: "/old",
+    sessionPath: "/sessions/old.jsonl",
+    spawnFn: (
+      /** @type {string} */ _bin,
+      /** @type {string[]} */ _argv,
+      /** @type {any} */ options,
+    ) => {
+      spawns.push({ child: current, options });
+      return current;
+    },
+    log: () => {},
+  });
+  const started = client.start();
+  setTimeout(() => current.reply(), 10);
+  await started;
+  assert.equal(spawns[0].options.cwd, "/old");
+
+  /** @type {any[]} */
+  const switching = [];
+  client.addEventListener("switching", (/** @type {any} */ e) =>
+    switching.push(e.detail),
+  );
+  /** @type {any[]} */
+  const restarting = [];
+  client.addEventListener("restarting", () => restarting.push(1));
+
+  const old = current;
+  const switched = client.setCwd("/new");
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(switching, [{ cwd: "/new" }]);
+  assert.equal(client.cwd, "/new");
+
+  // The killed child's exit is the expected trigger: immediate respawn,
+  // no crash-restart event, no crash-loop counting.
+  current = new FakeChild();
+  old.emit("exit", null, "SIGTERM");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(spawns.length, 2);
+  assert.equal(spawns[1].options.cwd, "/new");
+  assert.deepEqual(restarting, []);
+  assert.deepEqual(client.restartTimestamps, []);
+  assert.ok(client.argv().includes("anthropic/x"));
+  assert.equal(client.sessionPath, "/sessions/old.jsonl");
+
+  // The respawn probe fires ~300 ms after spawn; answer it.
+  const probing = current;
+  setTimeout(() => probing.reply(), 350);
+  await switched;
+  assert.equal(client.ready, true);
+  client.stop();
+});
+
+test("setCwd to the same cwd is a no-op", async () => {
+  const child = new FakeChild();
+  /** @type {any[]} */
+  const spawns = [];
+  const client = new PiRpcClient({
+    cwd: "/old",
+    spawnFn: (
+      /** @type {string} */ bin,
+      /** @type {string[]} */ argv,
+      /** @type {any} */ options,
+    ) => {
+      spawns.push({ bin, argv, options });
+      return child;
+    },
+    log: () => {},
+  });
+  const started = client.start();
+  setTimeout(() => child.reply(), 10);
+  await started;
+  await client.setCwd("/old");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(spawns.length, 1);
+  client.stop();
+});
+
+test("setCwd rejects when the replacement never becomes ready", async () => {
+  const child = new FakeChild();
+  let current = child;
+  const client = new PiRpcClient({
+    cwd: "/old",
+    spawnFn: () => current,
+    log: () => {},
+  });
+  const started = client.start();
+  setTimeout(() => current.reply(), 10);
+  await started;
+
+  const old = current;
+  const switched = client.setCwd("/new", { readyTimeoutMs: 200 });
+  current = new FakeChild();
+  old.emit("exit", null, "SIGTERM");
+  await assert.rejects(switched, /not ready in \/new/);
+  client.stop();
+});

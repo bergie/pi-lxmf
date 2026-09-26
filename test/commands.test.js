@@ -7,10 +7,13 @@ import { test } from "node:test";
 
 import {
   formatModelList,
+  formatRepoList,
   formatSessionStats,
   formatStatus,
+  isUnderWorkdir,
   matchModel,
   parseCommand,
+  resolveCwdTarget,
 } from "../src/commands.js";
 import { chunkText, formatDuration, formatTokens } from "../src/text.js";
 
@@ -71,6 +74,57 @@ test("formatModelList marks the current model", () => {
   assert.match(text, /openai\/gpt-5\.2.*← current/m);
 });
 
+test("isUnderWorkdir accepts the tree itself and descendants only", () => {
+  assert.equal(isUnderWorkdir("/w", "/w"), true);
+  assert.equal(isUnderWorkdir("/w/", "/w/x"), true);
+  assert.equal(isUnderWorkdir("/w", "/w/x/y"), true);
+  // A sibling sharing the prefix is NOT beneath the workdir.
+  assert.equal(isUnderWorkdir("/w", "/w2"), false);
+  assert.equal(isUnderWorkdir("/w", "/w x"), false);
+  assert.equal(isUnderWorkdir("/w", "/"), false);
+});
+
+test("resolveCwdTarget enforces the under-workdir boundary", () => {
+  const dirs = new Set(["/w", "/w/a", "/w/a/b"]);
+  const statDir = (/** @type {string} */ p) => {
+    if (!dirs.has(p)) throw new Error("ENOENT");
+    return { isDirectory: () => true };
+  };
+  assert.equal(resolveCwdTarget("/w", "a", statDir), "/w/a");
+  assert.equal(resolveCwdTarget("/w", "a/b", statDir), "/w/a/b");
+  assert.equal(resolveCwdTarget("/w", ".", statDir), "/w");
+  assert.equal(resolveCwdTarget("/w", "a/../a", statDir), "/w/a");
+  assert.equal(resolveCwdTarget("/w/", "a", statDir), "/w/a");
+  // Absolute paths are fine only inside the tree.
+  assert.equal(resolveCwdTarget("/w", "/w/a", statDir), "/w/a");
+  assert.equal(resolveCwdTarget("/w", "/etc", statDir), null);
+  // Traversal that escapes the tree is refused.
+  assert.equal(resolveCwdTarget("/w", "..", statDir), null);
+  assert.equal(resolveCwdTarget("/w", "../x", statDir), null);
+  assert.equal(resolveCwdTarget("/w/a", "../..", statDir), null);
+  // Missing paths and non-directories are refused.
+  assert.equal(resolveCwdTarget("/w", "missing", statDir), null);
+  assert.equal(resolveCwdTarget("/w", "", statDir), null);
+  assert.equal(resolveCwdTarget("/w", "   ", statDir), null);
+  const statFile = () => ({ isDirectory: () => false });
+  assert.equal(resolveCwdTarget("/w", "a", statFile), null);
+});
+
+test("formatRepoList shows the current repo and recent repos", () => {
+  const text = formatRepoList({
+    workdir: "/w",
+    cwd: "/w/a",
+    recentWorkdirs: ["/w/b", "/w/a/b"],
+  });
+  assert.match(text, /cwd: a \(\/w\/a\)/);
+  assert.match(text, /recent:\n {2}b\n {2}a\/b/);
+
+  assert.equal(
+    formatRepoList({ workdir: "/w", cwd: null, recentWorkdirs: [] }),
+    ["cwd: . (/w)", "recent: (none)"].join("\n"),
+  );
+});
+
 test("formatStatus and formatSessionStats", () => {
   const status = formatStatus(
     {
@@ -85,10 +139,14 @@ test("formatStatus and formatSessionStats", () => {
       deliveryHash: "b".repeat(32),
       owner: "c".repeat(32),
       uptimeMs: 3600_000,
+      workdir: "/w",
+      cwd: "/w/a",
     },
   );
   assert.match(status, /model: anthropic\/claude-sonnet-4-5/);
   assert.match(status, /session: fix-the-build · abc\.jsonl/);
+  assert.match(status, /cwd: \/w\/a/);
+  assert.match(status, /workdir: \/w/);
   assert.match(status, /uptime: 1h/);
 
   const stats = formatSessionStats({

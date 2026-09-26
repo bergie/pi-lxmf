@@ -112,6 +112,7 @@ export function assistantText(message) {
  * - `"event"`    — `{ detail: event }` for every non-response Pi event.
  * - `"ready"`    — the child is accepting commands (initially and after restarts).
  * - `"restarting"` — `{ detail: { code, signal, attempt } }` unexpected exit; respawn scheduled.
+ * - `"switching"` — `{ detail: { cwd } }` a `setCwd()` respawn starts; the old child is about to be killed.
  * - `"dead"`     — `{ detail: { reason } }` no more respawns will be attempted.
  *
  * @fires PiRpcClient#event
@@ -145,6 +146,8 @@ export class PiRpcClient extends EventTarget {
     this.pending = new Map();
     this.nextId = 0;
     this.stopped = false;
+    /** Set while a `setCwd()` respawn is pending: the old child's exit is expected, not a crash. */
+    this.intentionalRespawn = false;
     /** @type {number[]} */
     this.restartTimestamps = [];
     this.ready = false;
@@ -316,6 +319,16 @@ export class PiRpcClient extends EventTarget {
 
     if (this.stopped) return;
 
+    if (this.intentionalRespawn) {
+      // A setCwd() switch: the exit was expected. Spawn the replacement in
+      // the new cwd immediately — no backoff, no crash-loop counting.
+      this.intentionalRespawn = false;
+      this.log(`pi-lxmf: respawning pi in ${this.cwd} (cwd switch)`);
+      this.spawnChild();
+      this.probeUntilReady();
+      return;
+    }
+
     const now = Date.now();
     this.restartTimestamps = this.restartTimestamps.filter(
       (t) => now - t < 60000,
@@ -393,6 +406,77 @@ export class PiRpcClient extends EventTarget {
    */
   setSessionPath(path) {
     this.sessionPath = path;
+  }
+
+  /**
+   * Switches the child's working directory by respawning it — a supervised
+   * restart in the new cwd (the `/cd` path): the current child is killed
+   * (pending requests failed) and the replacement spawned immediately (no
+   * backoff, no crash-loop counting), carrying `--model` and whatever
+   * session path `setSessionPath()` last set. Pi therefore discovers the
+   * new repo's `AGENTS.md`/`.pi` and re-evaluates project trust fresh,
+   * exactly as a manual restart would. Resolves once the replacement
+   * answers commands; rejects on timeout or when restarting is given up.
+   *
+   * @param {string} absPath - Absolute directory to run Pi in.
+   * @param {object} [options]
+   * @param {number} [options.readyTimeoutMs=30000] - Budget for the replacement's first answer.
+   * @returns {Promise<void>}
+   */
+  async setCwd(absPath, options = {}) {
+    if (absPath === this.cwd) return;
+    if (this.stopped) throw new RpcError("PiRpcClient is stopped");
+    const readyTimeoutMs = options.readyTimeoutMs ?? 30000;
+    this.cwd = absPath;
+    if (!this.child && this.firstReady === null) {
+      // Never started: start() picks the new cwd up.
+      return;
+    }
+    this.intentionalRespawn = true;
+    this.dispatchEvent(
+      new CustomEvent("switching", { detail: { cwd: absPath } }),
+    );
+    const switched = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new RpcError(
+            `pi not ready in ${absPath} within ${readyTimeoutMs} ms`,
+            "setCwd",
+          ),
+        );
+      }, readyTimeoutMs);
+      const onReady = () => {
+        cleanup();
+        resolve(undefined);
+      };
+      const onDead = (/** @type {any} */ e) => {
+        cleanup();
+        reject(
+          new RpcError(
+            `pi in ${absPath} is not recovering: ${e.detail?.reason ?? "unknown reason"}`,
+            "setCwd",
+          ),
+        );
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.removeEventListener("ready", onReady);
+        this.removeEventListener("dead", onDead);
+      };
+      this.addEventListener("ready", onReady);
+      this.addEventListener("dead", onDead);
+    });
+    if (this.child) {
+      // handleExit() sees the intentional flag and spawns the replacement
+      // as soon as the killed child reports its exit.
+      this.child.kill("SIGTERM");
+    } else {
+      // Between restarts: spawn the replacement directly.
+      this.spawnChild();
+      this.probeUntilReady();
+    }
+    await switched;
   }
 
   /**

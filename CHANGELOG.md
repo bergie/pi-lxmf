@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Multi-repo support via `/cd` (work doc #2): one bridge can serve every
+  repo under the daemon's start folder. `/cd <path>` switches the
+  supervised Pi at runtime through a deliberate supervised respawn in the
+  new cwd (no backoff, no crash-loop counting; `--model` carried across,
+  the target repo's per-workdir session pointer applied via `--session`, so
+  revisiting a repo resumes its conversation and a new repo starts fresh).
+  Mid-run switches close the open exchange without empty-tail recovery.
+  Boundary: only paths that resolve under the daemon `workdir` — the
+  trust root — are accepted (`..` traversal, outside absolute paths,
+  missing or non-directory targets are refused without touching the child);
+  `resolveCwdTarget` in `src/commands.js` is the single choke point, kept
+  ready for future DACAR per-subtree identity checks. The active cwd is
+  persisted (`dataDir/cwd.json`) and revalidated at startup so restarts
+  resume in the last repo. `/cd` without arguments lists the current and
+  recently used repos (per-workdir session pointers now record their
+  workdir), and `/status` shows the current `cwd` and `workdir`.
+
 ## [0.1.1] - 2026-09-24
 
 ### Added
