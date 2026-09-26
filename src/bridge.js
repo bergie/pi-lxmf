@@ -612,9 +612,16 @@ export class Bridge {
       /* switch reply still goes out; the next prompt re-observes */
     }
     const rel = relative(this.config.workdir, absPath) || ".";
-    return pointer
-      ? `Switched to ${rel}. Resuming session ${basename(pointer.sessionFile)}.`
-      : `Switched to ${rel}. Fresh session.`;
+    // A visually loud banner: project changes are the main boundaries
+    // in the message history, so they must be easy to spot while
+    // scrolling back.
+    const lines = ["📂 ───────────────────", `📂 Switched to ${rel}`];
+    lines.push(
+      pointer
+        ? `🔁 Resuming session ${basename(pointer.sessionFile)}`
+        : "✨ Fresh session",
+    );
+    return lines.join("\n");
   }
 
   /**

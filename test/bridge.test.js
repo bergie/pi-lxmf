@@ -636,8 +636,9 @@ test("/cd switches the supervised Pi into another repo and resumes its session",
     assert.equal(rpc.sessionPath, "/sessions/repo-b.jsonl");
     assert.equal(bridge.currentCwd, repoB);
     assert.equal(state.savedCwd, repoB);
-    assert.match(lastSent(mesh), /Switched to repo-b./);
-    assert.match(lastSent(mesh), /Resuming session repo-b\.jsonl/);
+    assert.match(lastSent(mesh), /^📂 ─+$/m);
+    assert.match(lastSent(mesh), /📂 Switched to repo-b/);
+    assert.match(lastSent(mesh), /🔁 Resuming session repo-b\.jsonl/);
     // The resumed session observation persists under ITS workdir key.
     assert.equal(state.sessions[repoB], "/sessions/repo-b.jsonl");
   } finally {
@@ -660,8 +661,8 @@ test("/cd into a repo without a pointer starts a fresh session", async () => {
     assert.deepEqual(rpc.cwdSwitches, [repoC]);
     assert.equal(rpc.sessionPath, "/sessions/current.jsonl"); // the fresh session observed after the switch
     assert.equal(state.savedCwd, repoC);
-    assert.match(lastSent(mesh), /Switched to repo-c\./);
-    assert.match(lastSent(mesh), /Fresh session\./);
+    assert.match(lastSent(mesh), /📂 Switched to repo-c/);
+    assert.match(lastSent(mesh), /✨ Fresh session/);
     // The fresh session (reported by get_state) persists under repo-c's key.
     assert.equal(state.sessions[repoC], "/sessions/current.jsonl");
   } finally {
@@ -759,7 +760,7 @@ test("/cd mid-run closes the exchange without empty-tail recovery", async () => 
     rpc.emitEvent({ type: "agent_settled" });
     await sleep(10);
     assert.equal(rpc.prompts.length, 1); // just the original prompt
-    assert.match(lastSent(mesh), /Switched to repo-b\./);
+    assert.match(lastSent(mesh), /📂 Switched to repo-b/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

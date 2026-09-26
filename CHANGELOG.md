@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The successful `/cd` reply is now a visually distinct banner (divider
+  line, 📂/🔁/✨ emoji) so project change boundaries are easy to spot when
+  scrolling back through the message history.
+
+### Fixed
+
+- Startup notification lost to the announce race: reticulum-js keeps the
+  destination→identity mapping in memory, so right after a daemon restart
+  the owner's `lxmf.delivery` hash is unknown and the router fails the
+  "🟢 ready" send instantly (its path request only happens once the
+  identity is known). `sendWithRetry` now recognises that failure, sends a
+  path request (which solicits an announce from the peer or a node holding
+  its path) and waits up to 30s for the announce before retrying — instead
+  of burning two hopeless immediate retries and parking the text in the
+  next reply's delivery-failure note.
+- Configured propagation node was never used for outbound: reticulum-js's
+  `lxmf.send` never consults the outbound propagation node on its own
+  (unlike Python's `LXMRouter`), so despite `setOutboundPropagationNode`
+  being called, replies to an off-mesh owner were simply lost. The retry
+  chain now escalates to `submitToPropagationNode` (store-and-forward,
+  delivered on the owner's next sync) after direct and opportunistic
+  delivery both fail — including waiting for the node's own announce on a
+  fresh start. The chain lives in the exported `createRetrySender`
+  (unit-tested against a fake router) instead of a closure inside
+  `startLxmf`.
+
 ## [0.1.2] - 2026-09-27
 
 ### Added
