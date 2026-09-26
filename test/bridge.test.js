@@ -1067,8 +1067,8 @@ test("quota-recovery notification delivers to the owner on a zai model", async (
   const state = new FakeState();
   /** @type {{fiveHourPct: number, weeklyPct: number}} */
   const live = { fiveHourPct: 100, weeklyPct: 12 };
-  /** @param {string} _url @param {{headers?: any}} [opts] */
-  const fetchImpl = async (_url, opts) => ({
+  /** @param {string} _url */
+  const fetchImpl = async (_url) => ({
     ok: true,
     json: async () => ({
       code: 200,
@@ -1133,6 +1133,7 @@ test("quota-recovery notification delivers to the owner on a zai model", async (
     success: false,
     finalError: "403 quota exceeded",
   });
+  rpc.emitEvent({ type: "agent_settled" });
   await sleep(5);
   assert.equal(watcher.wasExhausted, true);
 
@@ -1209,4 +1210,138 @@ test("quota watcher is disabled when active model is not zai", async () => {
   await sleep(15);
   assert.equal(mesh.sent.length, 0, "no notification for non-zai model");
   watcher.stop();
+});
+
+test("/model switch re-observes state: watcher gate follows immediately", async () => {
+  const rpc = new FakeRpc();
+  const mesh = new FakeMesh();
+  const state = new FakeState();
+  const watcher = new GlmQuotaWatcher({
+    ownerDestinationHash: OWNER_DEST,
+    sendText: async (destHex, text) => mesh.sendText(destHex, text, {}),
+    log: { log: () => {}, error: () => {} },
+    apiKey: "key",
+    fetchImpl: /** @type {any} */ (
+      async () => ({
+        ok: true,
+        json: async () => ({
+          code: 200,
+          data: {
+            limits: [
+              {
+                type: "TOKENS_LIMIT",
+                unit: 3,
+                percentage: 10,
+                nextResetTime: 0,
+              },
+            ],
+            level: "pro",
+          },
+        }),
+      })
+    ),
+    now: () => Date.UTC(2026, 8, 28, 12, 0, 0),
+    pollIntervalMs: 10,
+  });
+  const bridge = new Bridge({
+    config: /** @type {any} */ ({
+      midRunBehavior: "steer",
+      chunkChars: 2500,
+      name: "test-node",
+      owner: OWNER,
+    }),
+    rpc: /** @type {any} */ (rpc),
+    mesh,
+    state,
+    quotaWatcher: watcher,
+    log: { log: () => {}, error: () => {} },
+    onShutdown: () => {},
+  });
+  bridge.start();
+  bridge.setRpcReady(true);
+
+  // Prompt observes a cortecs model: watcher disabled.
+  rpc.states.push({ model: { provider: "cortecs", id: "claude-opus-5.5" } });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "work" });
+  await bridge.queue;
+  await sleep(5);
+  assert.equal(watcher.enabled, false, "cortecs: watcher disabled");
+
+  // /model switches to GLM: the post-command re-observation enables the
+  // watcher right away — no prompt in between.
+  rpc.states.push({ model: { provider: "zai", id: "glm-5.3-flash" } });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/model zai/glm" });
+  await bridge.queue;
+  await sleep(5);
+  assert.equal(watcher.enabled, true, "/model re-observation enabled watcher");
+  watcher.stop();
+});
+
+test("startup notification names the active model", async () => {
+  const rpc = new FakeRpc();
+  const mesh = new FakeMesh();
+  const state = new FakeState();
+  const bridge = new Bridge({
+    config: /** @type {any} */ ({
+      midRunBehavior: "steer",
+      chunkChars: 2500,
+      name: "test-node",
+      owner: OWNER,
+    }),
+    rpc: /** @type {any} */ (rpc),
+    mesh,
+    state,
+    log: { log: () => {}, error: () => {} },
+    onShutdown: () => {},
+  });
+  bridge.start();
+  bridge.setRpcReady(true);
+
+  // The boot-time get_state reports the active model.
+  rpc.states.push({
+    model: { provider: "zai", id: "glm-5.2", name: "GLM 5.2" },
+  });
+  await bridge.notifyStartup();
+  const text = lastSent(mesh);
+  assert.match(text, /Model: GLM 5\.2/);
+  assert.equal(bridge.activeModel?.id, "glm-5.2");
+});
+
+test("mid-run failure after partial output is reported, not swallowed", async () => {
+  const { bridge, rpc, mesh } = makeBridge({ owner: OWNER });
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "task" });
+  await bridge.queue;
+  rpc.emitEvent({ type: "agent_start" });
+  // Partial output lands, then the run dies with an error.
+  rpc.emitEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "partial work" }],
+    },
+  });
+  rpc.emitEvent({
+    type: "auto_retry_end",
+    success: false,
+    finalError: "503 overloaded",
+  });
+  rpc.emitEvent({ type: "agent_settled" });
+  await sleep(10);
+
+  assert.deepEqual(
+    mesh.sent.map((s) => s.text),
+    ["partial work", "⚠️ run ended early: 503 overloaded"],
+  );
+
+  // The error must not leak into a later exchange.
+  mesh.emitMessage({ sourceHash: OWNER_DEST, content: "next task" });
+  await bridge.queue;
+  rpc.emitEvent({ type: "agent_start" });
+  rpc.emitEvent({ type: "agent_settled" });
+  await sleep(10);
+  const texts = mesh.sent.map((s) => s.text).join("\n");
+  assert.doesNotMatch(
+    texts.slice(texts.indexOf("done (no reply)")),
+    /503 overloaded/,
+  );
 });

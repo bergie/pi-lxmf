@@ -23,53 +23,44 @@ const OWNER_DEST = "c".repeat(32);
 /** @param {number} ms */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Builds a fake fetch returning the given quota payload.
- * @param {{limits: any[], level?: string}} payload
+/**
+ * Builds a fetch impl backed by a mutable live quota state, so tests can
+ * flip buckets between polls.
+ *
+ * @param {{fiveHourPct: number, weeklyPct: number, fiveHourReset?: number, weeklyReset?: number}} live
  * @returns {any}
  */
-function fakeFetch(payload) {
+function liveFetch(live) {
   /** @param {string} _url @param {{headers?: any}} [opts] */
   const fn = async (_url, opts) => {
-    fn.calls.push({ url: _url, auth: opts?.headers?.Authorization });
+    fn.calls.push({ auth: opts?.headers?.Authorization });
     return {
       ok: true,
       json: async () => ({
         code: 200,
         data: {
-          limits: payload.limits,
-          level: payload.level ?? "pro",
+          limits: [
+            {
+              type: "TOKENS_LIMIT",
+              unit: 3,
+              percentage: live.fiveHourPct,
+              nextResetTime: live.fiveHourReset ?? 0,
+            },
+            {
+              type: "TOKENS_LIMIT",
+              unit: 6,
+              percentage: live.weeklyPct,
+              nextResetTime: live.weeklyReset ?? 0,
+            },
+          ],
+          level: "pro",
         },
       }),
     };
   };
-  /** @type {Array<{url: string, auth: string}>} */
+  /** @type {Array<{auth: string}>} */
   fn.calls = [];
   return fn;
-}
-
-/**
- * @param {number} fiveHourPct
- * @param {number} [weeklyPct]
- * @param {number} [nextReset]
- */
-function quotaPayload(fiveHourPct, weeklyPct = 10, nextReset = 0) {
-  return {
-    limits: [
-      {
-        type: "TOKENS_LIMIT",
-        unit: 3,
-        percentage: fiveHourPct,
-        nextResetTime: nextReset,
-      },
-      {
-        type: "TOKENS_LIMIT",
-        unit: 6,
-        percentage: weeklyPct,
-        nextResetTime: nextReset,
-      },
-    ],
-    level: "pro",
-  };
 }
 
 /** @returns {{send: any, sent: Array<{destHex: string, text: string}>}} */
@@ -81,6 +72,26 @@ function fakeSend() {
     sent.push({ destHex, text });
   };
   return { send, sent };
+}
+
+/**
+ * Watcher factory with sensible test defaults.
+ *
+ * @param {object} options - `GlmQuotaWatcher` constructor options; only
+ *   `ownerDestinationHash` and `sendText` are defaulted here.
+ * @param {{send: any, sent: any[]}} [sink] - Fake send sink (optional).
+ * @returns {{w: any, sent: any[]}}
+ */
+function makeWatcher(options = {}, sink) {
+  const fake = sink ?? fakeSend();
+  const w = new GlmQuotaWatcher({
+    ownerDestinationHash: OWNER_DEST,
+    sendText: fake.send,
+    apiKey: "key",
+    pollIntervalMs: 10,
+    ...options,
+  });
+  return { w, sent: fake.sent };
 }
 
 test("isZaiModel gates on provider zai / z.ai only", () => {
@@ -138,13 +149,9 @@ test("msUntilPeakOpen schedules to the next weekday 06:00 UTC", () => {
 });
 
 test("missing zai key disables the watcher without throwing", () => {
-  const { sent } = fakeSend();
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
+  const { w, sent } = makeWatcher({
     apiKey: null,
+    fetchImpl: liveFetch({ fiveHourPct: 100, weeklyPct: 10 }),
   });
   // Everything is a no-op when disabled by missing key.
   w.setEnabled(true);
@@ -155,20 +162,13 @@ test("missing zai key disables the watcher without throwing", () => {
 });
 
 test("non-zai model: nothing fires", async () => {
-  const fetchImpl = fakeFetch(quotaPayload(100, 10));
-  const { sent } = fakeSend();
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
+  const fetchImpl = liveFetch({ fiveHourPct: 100, weeklyPct: 10 });
+  const { w, sent } = makeWatcher({
     fetchImpl,
     now: () => Date.UTC(2026, 8, 28, 7, 0, 0), // peak time
-    pollIntervalMs: 10,
   });
   // Never enabled (active model is cortecs): errors and agent_start do nothing.
-  w.onError("403 quota exceeded");
+  w.onError("403 quota exhausted");
   w.onAgentStart(true);
   await sleep(20);
   assert.equal(sent.length, 0);
@@ -176,99 +176,153 @@ test("non-zai model: nothing fires", async () => {
   w.stop();
 });
 
-test("quota error on a GLM model arms the watcher; recovery delivers one message", async () => {
-  /** @type {{fiveHourPct: number, weeklyPct: number}} */
-  const live = { fiveHourPct: 100, weeklyPct: 62 };
-  /** @type {any} */
-  const fetchImpl = async (
-    /** @type {string} */ _url,
-    /** @type {{headers?: any}} */ opts,
-  ) => {
-    fetchImpl.calls.push({ auth: opts?.headers?.Authorization });
-    return {
-      ok: true,
-      json: async () => ({
-        code: 200,
-        data: {
-          limits: quotaPayload(live.fiveHourPct, live.weeklyPct).limits,
-          level: "pro",
-        },
-      }),
-    };
-  };
-  /** @type {Array<{auth: string}>} */
-  fetchImpl.calls = [];
+test("enabling on an exhausted bucket notifies immediately (startup case)", async () => {
+  const fetchImpl = liveFetch({ fiveHourPct: 100, weeklyPct: 62 });
+  const fetchCalls = fetchImpl;
+  const nowMs = Date.UTC(2026, 8, 28, 12, 0, 0); // non-peak
+  const { w, sent } = makeWatcher({
+    fetchImpl,
+    now: () => nowMs,
+  });
+  // Daemon start with the active model already GLM: setEnabled(true) is
+  // the first gate flip; the first sample runs immediately.
+  w.setEnabled(true);
+  await sleep(10);
+  assert.ok(fetchCalls.calls.length >= 1, "immediate startup sample");
+  assert.equal(sent.length, 1, "exhaustion notice delivered at startup");
+  assert.match(sent[0].text, /5h quota exhausted/);
+  assert.equal(sent[0].destHex, OWNER_DEST);
+  assert.ok(w.pollTimer, "continuous sampler running while enabled");
+  // No duplicate notice from subsequent samples.
+  await sleep(25);
+  assert.equal(sent.length, 1, "exhaustion notice is once per episode");
+  w.stop();
+});
 
-  const { sent } = fakeSend();
+test("quota error on a GLM model arms the sampler; recovery delivers one message", async () => {
+  const live = { fiveHourPct: 100, weeklyPct: 62 };
+  const fetchImpl = liveFetch(live);
   const t0 = Date.UTC(2026, 8, 28, 12, 0, 0); // non-peak
   let nowMs = t0;
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
-    fetchImpl: /** @type {any} */ (fetchImpl),
+  const { w, sent } = makeWatcher({
+    fetchImpl,
     now: () => nowMs,
-    pollIntervalMs: 5,
   });
   w.setEnabled(true); // active model is GLM
+  await sleep(10);
+  // The startup sample already notified exhaustion; clear it.
+  sent.length = 0;
   w.onError("403 quota exceeded");
-  await sleep(5);
+  await sleep(10);
   assert.equal(w.wasExhausted, true);
-  assert.ok(w.pollTimer, "poller armed");
+  assert.ok(w.pollTimer, "sampler running");
+  // The error-triggered sample must not duplicate the exhaustion notice.
+  assert.equal(sent.length, 0, "no duplicate exhaustion notice");
 
   // Recover: advance time + flip the bucket.
   nowMs += 90 * 60_000; // 90 min later
   live.fiveHourPct = 20;
   await sleep(20);
-  assert.equal(sent.length, 1, "exactly one recovery notification");
-  assert.match(sent[0].text, /5h quota available again/);
-  assert.match(sent[0].text, /Weekly: 62%/);
-  assert.match(sent[0].text, /1h 30m/);
-  assert.equal(w.pollTimer, null, "poller stopped after notify");
+  const recoveries = sent.filter((s) => /available again/.test(s.text));
+  assert.equal(recoveries.length, 1, "exactly one recovery notification");
+  assert.match(recoveries[0].text, /5h quota available again/);
+  assert.match(recoveries[0].text, /Weekly: 62%/);
+  assert.match(recoveries[0].text, /1h 30m/);
+  assert.equal(w.wasExhausted, false);
   w.stop();
 });
 
-test("a second error while the watcher is already running does not start a second watcher or re-notify", async () => {
-  const fetchImpl = fakeFetch(quotaPayload(100, 10));
-  const { sent } = fakeSend();
-  const nowMs = 1000;
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
-    fetchImpl,
-    now: () => nowMs,
-    pollIntervalMs: 10,
-  });
+test("crossing 90% warns once per window (5h and weekly)", async () => {
+  const live = { fiveHourPct: 89, weeklyPct: 91 };
+  const fetchImpl = liveFetch(live);
+  const now = () => Date.UTC(2026, 8, 28, 12, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
   w.setEnabled(true);
-  w.onError("403 quota exceeded");
-  await sleep(5);
+  await sleep(10);
+  // First sample: 5h at 89% (no warning), weekly at 91% (warn).
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /weekly quota at 91%/);
+  assert.doesNotMatch(sent[0].text, /5h quota at/);
+
+  // 5h crosses the threshold on a later sample: one warning, no repeat.
+  live.fiveHourPct = 92;
+  await sleep(25);
+  const warns = sent.filter((s) => /5h quota at 92%/.test(s.text));
+  assert.equal(warns.length, 1);
+  const total5hWarns = sent.filter((s) => /5h quota at/.test(s.text)).length;
+  assert.equal(total5hWarns, 1, "no repeated 5h warning in the same window");
+  const totalWeeklyWarns = sent.filter((s) =>
+    /weekly quota at/.test(s.text),
+  ).length;
+  assert.equal(totalWeeklyWarns, 1, "no repeated weekly warning");
+  w.stop();
+});
+
+test("exhaustion suppresses the 90% warning until the window resets", async () => {
+  const live = { fiveHourPct: 100, weeklyPct: 10 };
+  const fetchImpl = liveFetch(live);
+  const now = () => Date.UTC(2026, 8, 28, 12, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
+  w.setEnabled(true);
+  await sleep(10);
+  assert.match(sent[0].text, /exhausted/);
+  // Recovery lands at 95%: above the threshold, but the window's warning
+  // was consumed by the episode — no "at 95%" line.
+  live.fiveHourPct = 95;
+  await sleep(25);
+  const recovered = sent.find((s) => /available again/.test(s.text));
+  assert.ok(recovered, "recovery notice delivered");
+  assert.equal(
+    sent.filter((s) => /5h quota at/.test(s.text)).length,
+    0,
+    "no 90% warning in the episode's window",
+  );
+  w.stop();
+});
+
+test("a second error while the sampler is running does not start a second poller or re-notify", async () => {
+  const live = { fiveHourPct: 100, weeklyPct: 10 };
+  const fetchImpl = liveFetch(live);
+  const now = () => Date.UTC(2026, 8, 28, 12, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
+  w.setEnabled(true);
+  await sleep(10);
+  sent.length = 0; // drop the startup exhaustion notice
   const firstTimer = w.pollTimer;
   assert.ok(firstTimer);
   w.onError("429 usage limit reached");
-  await sleep(5);
+  await sleep(10);
   assert.equal(w.pollTimer, firstTimer, "no second poller");
-  assert.equal(sent.length, 0, "no notification while still exhausted");
+  assert.equal(sent.length, 0, "no duplicate notification while exhausted");
+  w.stop();
+});
+
+test("notices are deferred to agent_settled while an owner-triggered run is live", async () => {
+  const live = { fiveHourPct: 40, weeklyPct: 10 };
+  const fetchImpl = liveFetch(live);
+  const now = () => Date.UTC(2026, 8, 28, 12, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
+  w.setEnabled(true);
+  await sleep(10);
+  assert.equal(sent.length, 0, "nothing to warn about yet");
+
+  // Run starts; quota exhausts mid-run.
+  w.onAgentStart(true);
+  live.fiveHourPct = 100;
+  await sleep(25);
+  assert.equal(sent.length, 0, "exhaustion notice held while the run is live");
+  // The run settles: the queued notice goes out.
+  w.onAgentSettled();
+  await sleep(10);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /exhausted/);
   w.stop();
 });
 
 test("start-of-run peak warning fires once per run during peak hours", async () => {
-  const fetchImpl = fakeFetch(quotaPayload(0, 0));
-  const { sent } = fakeSend();
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
-    fetchImpl,
-    now: () => Date.UTC(2026, 8, 28, 7, 0, 0), // Mon 07:00 UTC = peak
-    pollIntervalMs: 10,
-  });
+  const fetchImpl = liveFetch({ fiveHourPct: 0, weeklyPct: 0 });
+  const now = () => Date.UTC(2026, 8, 28, 7, 0, 0); // Mon 07:00 UTC = peak
+  const { w, sent } = makeWatcher({ fetchImpl, now });
   w.setEnabled(true);
   w.onAgentStart(true);
   assert.equal(sent.length, 1);
@@ -281,18 +335,9 @@ test("start-of-run peak warning fires once per run during peak hours", async () 
 });
 
 test("recovery run does not trigger a peak warning", async () => {
-  const fetchImpl = fakeFetch(quotaPayload(0, 0));
-  const { sent } = fakeSend();
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
-    fetchImpl,
-    now: () => Date.UTC(2026, 8, 28, 7, 0, 0),
-    pollIntervalMs: 10,
-  });
+  const fetchImpl = liveFetch({ fiveHourPct: 0, weeklyPct: 0 });
+  const now = () => Date.UTC(2026, 8, 28, 7, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
   w.setEnabled(true);
   w.onAgentStart(false); // recovery run
   assert.equal(sent.length, 0);
@@ -300,20 +345,10 @@ test("recovery run does not trigger a peak warning", async () => {
 });
 
 test("run that crosses into the peak window warns mid-run", async () => {
-  const fetchImpl = fakeFetch(quotaPayload(0, 0));
-  const { sent } = fakeSend();
+  const fetchImpl = liveFetch({ fiveHourPct: 0, weeklyPct: 0 });
   // Start 1ms before peak: Mon 05:59:59.999 UTC. Window opens at 06:00.
   let nowMs = Date.UTC(2026, 8, 28, 5, 59, 59, 999);
-  const w = new GlmQuotaWatcher({
-    ownerDestinationHash: OWNER_DEST,
-    sendText: async (d, t) => {
-      sent.push({ destHex: d, text: t });
-    },
-    apiKey: "key",
-    fetchImpl,
-    now: () => nowMs,
-    pollIntervalMs: 10,
-  });
+  const { w, sent } = makeWatcher({ fetchImpl, now: () => nowMs });
   w.setEnabled(true);
   w.onAgentStart(true);
   assert.equal(sent.length, 0, "not yet in peak");
@@ -323,6 +358,26 @@ test("run that crosses into the peak window warns mid-run", async () => {
   assert.equal(sent.length, 1, "warned when window opened mid-run");
   assert.match(sent[0].text, /peak hours now/);
   w.stop();
+});
+
+test("disabling (model switch) stops the sampler and flushes queued notices", async () => {
+  const live = { fiveHourPct: 40, weeklyPct: 10 };
+  const fetchImpl = liveFetch(live);
+  const now = () => Date.UTC(2026, 8, 28, 12, 0, 0);
+  const { w, sent } = makeWatcher({ fetchImpl, now });
+  w.setEnabled(true);
+  await sleep(10);
+  assert.equal(sent.length, 0, "nothing to warn about yet");
+  // Owner-triggered run goes live; quota exhausts mid-run.
+  w.onAgentStart(true);
+  live.fiveHourPct = 100;
+  await sleep(25);
+  assert.equal(sent.length, 0, "notice queued, not yet flushed");
+  // The owner switches models mid-run: the gate flip must not lose it.
+  w.setEnabled(false);
+  assert.equal(w.pollTimer, null, "sampler stopped");
+  assert.equal(sent.length, 1, "queued notice flushed on disable");
+  assert.match(sent[0].text, /exhausted/);
 });
 
 test("readZaiKey returns null when auth file is missing", () => {

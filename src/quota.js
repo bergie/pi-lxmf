@@ -3,15 +3,27 @@
  *
  * z.ai (GLM Coding Plan) quota watcher + peak-hours warning (work doc #3).
  *
- * Two related behaviours, both gated on the active model being a z.ai GLM
+ * Three related behaviours, all gated on the active model being a z.ai GLM
  * model (`provider === "zai"`):
  *
- * 1. **Quota-recovery notification.** When a run fails with a z.ai
- *    quota-exhausted error, poll the z.ai quota endpoint and push exactly
- *    one LXMF message to the owner the moment the 5h bucket becomes
- *    available again, so the owner can resume work without babysitting it.
+ * 1. **Continuous quota sampling.** While a GLM model is active, the same
+ *    z.ai quota endpoint `pi-glm-usage` uses is polled every 60s. From
+ *    those samples the owner is notified of:
+ *    - **Exhaustion** (once per episode): a bucket (5h or weekly) reaches
+ *      100% — including at startup, when a daemon restarts mid-outage.
+ *    - **90% warning** (once per bucket window): a bucket crosses 90%,
+ *      while still below 100%.
+ *    - **Recovery** (once per episode): the 5h bucket drops below 100%
+ *      after an exhausted episode.
+ *    Per-sample notifications are joined into a single LXMF message and
+ *    deferred to `agent_settled` while an owner-triggered run is live.
  *
- * 2. **Peak-hours warning.** z.ai charges 3× tokens during peak hours
+ * 2. **Quota-error arming.** A Pi error that looks like a z.ai
+ *    quota-exhausted failure (`auto_retry_end`/`compaction_end`) arms the
+ *    poller immediately, even when the live fetch is momentarily
+ *    inconclusive — the authoritative answer is the next sample.
+ *
+ * 3. **Peak-hours warning.** z.ai charges 3× tokens during peak hours
  *    (Mon–Fri 14:00–18:00 Singapore Standard Time, UTC+8). Warn the owner
  *    when an owner-triggered run starts inside that window, and when the
  *    window opens mid-run, so they can decide whether to stop or continue.
@@ -30,7 +42,7 @@ import { join } from "node:path";
 const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
 /** Fetch timeout for the quota endpoint (ms). */
 const FETCH_TIMEOUT_MS = 5000;
-/** Poll cadence while the 5h bucket is exhausted (ms). */
+/** Sampling cadence while a GLM model is active (ms). */
 const POLL_INTERVAL_MS = 60_000;
 
 /**
@@ -56,9 +68,11 @@ const Unit = {
 };
 
 /**
- * The 5h bucket is treated as exhausted at-or-above this percentage.
+ * A bucket is treated as exhausted at-or-above this percentage.
  */
 const EXHAUSTED_PERCENTAGE = 100;
+/** Warning threshold (crossing upward, while not exhausted). */
+const WARN_PERCENTAGE = 90;
 
 /** z.ai provider id (and its `z.ai` alias, defensively). */
 const ZAI_PROVIDERS = new Set(["zai", "z.ai"]);
@@ -196,7 +210,6 @@ export function isPeakTime(epochMs) {
  */
 export function msUntilPeakOpen(fromMs) {
   if (isPeakTime(fromMs)) return 0;
-  const from = new Date(fromMs);
   // Walk forward hour by hour (max ~7 days) to the first peak hour.
   for (let h = 0; h < 24 * 7; h++) {
     const probe = new Date(fromMs + h * 3_600_000);
@@ -223,10 +236,34 @@ export function msUntilPeakOpen(fromMs) {
 }
 
 /**
+ * A live or pinned quota sample for one bucket. `percentage` may exceed
+ * `WARN_PERCENTAGE`/`EXHAUSTED_PERCENTAGE` by z.ai's rounding; comparisons
+ * are inclusive.
+ *
+ * @typedef {{percentage: number, nextResetMs: number}} BucketSample
+ */
+
+/**
  * The z.ai quota watcher + peak-hours warner. Construct one per bridge;
  * drive it with {@link GlmQuotaWatcher.setEnabled} (gated on the active
- * model) and {@link GlmQuotaWatcher.onAgentStart} / {@link
- * GlmQuotaWatcher.onAgentSettled} / {@link GlmQuotaWatcher.onError}.
+ * model) and {@link GlmQuotaWatcher.onAgentStart} /
+ * {@link GlmQuotaWatcher.onAgentSettled} / {@link GlmQuotaWatcher.onError}.
+ *
+ * While enabled, a single sampler polls the quota endpoint every
+ * `pollIntervalMs` (first sample immediately). Each sample can queue at
+ * most one joined notice:
+ * - a bucket crossing `WARN_PERCENTAGE` (once per bucket window) queues
+ *   a "90%" warning line;
+ * - a bucket reaching `EXHAUSTED_PERCENTAGE` (once per bucket episode)
+ *   queues an "exhausted" line with the reset time;
+ * - the 5h bucket recovering from an exhausted episode (once per episode)
+ *   queues a "recovered" line.
+ *
+ * A run-triggered error ({@link GlmQuotaWatcher.onError}) additionally
+ * forces an immediate sample (fresh state over stale-sampler lag).
+ * Notices are delivered as one LXMF message per emission — immediately
+ * when the bridge is idle, or when the live owner-triggered run settles
+ * (so they never interleave with a reply mid-run).
  */
 export class GlmQuotaWatcher {
   /**
@@ -238,6 +275,7 @@ export class GlmQuotaWatcher {
    * @param {typeof fetch} [options.fetchImpl] - Injectable fetch (tests).
    * @param {() => number} [options.now] - Injectable clock (tests).
    * @param {number} [options.pollIntervalMs]
+   * @param {number} [options.warnPercentage] - Warning threshold (tests).
    */
   constructor(options) {
     this.ownerDestinationHash = options.ownerDestinationHash;
@@ -247,6 +285,7 @@ export class GlmQuotaWatcher {
     this.fetchImpl = options.fetchImpl || fetch;
     this.now = options.now || (() => Date.now());
     this.pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.warnPercentage = options.warnPercentage ?? WARN_PERCENTAGE;
 
     /** Whether the active model is a z.ai GLM model (the master gate). */
     this.enabled = false;
@@ -254,15 +293,28 @@ export class GlmQuotaWatcher {
     this.runActive = false;
     /** Whether the current run is owner-triggered (not recovery). */
     this.ownerTriggered = false;
-    /** Single active quota poller (idempotent start). */
+    /** Single active sampler (idempotent start). */
     /** @type {NodeJS.Timeout|null} */
     this.pollTimer = null;
-    /** Whether the 5h bucket was exhausted when the poller last sampled. */
+    /** Whether the 5h bucket was exhausted in the last sample. */
     this.wasExhausted = false;
-    /** Whether a recovery notification has already been sent for this episode. */
-    this.notifiedThisEpisode = false;
     /** Epoch (ms) the exhaustion episode started, for the human-readable delta. */
     this.exhaustedSinceMs = 0;
+    /**
+     * Whether the 90% warning already fired for each bucket in its current
+     * window (a window is any contiguous below-100% stretch — a reset to
+     * below-warn clears it, an exhausted episode ends it).
+     * @type {{fiveHour: boolean, weekly: boolean}}
+     */
+    this.warned = { fiveHour: false, weekly: false };
+    /** Whether an exhausted episode per bucket already notified (its
+     * "exhausted" notice is once per episode).
+     * @type {{fiveHour: boolean, weekly: boolean}}
+     */
+    this.exhaustionNotified = { fiveHour: false, weekly: false };
+    /** Notices queued while a run is live, delivered on `onAgentSettled`. */
+    /** @type {string[]} */
+    this.pendingNotices = [];
     /** Whether we've already warned about peak for the current run. */
     this.peakWarnedThisRun = false;
     /** Timer for the "run ran into peak" boundary warning. */
@@ -276,7 +328,12 @@ export class GlmQuotaWatcher {
 
   /**
    * Master gate: enable/disable based on whether the active model is z.ai.
-   * Disabling stops any active poller and clears run state.
+   * Enabling starts the sampler immediately (first sample right away), so
+   * an exhausted state at startup or model switch is detected and
+   * notified without waiting for a run or an error. Disabling stops all
+   * timers, clears run state, and (best-effort) delivers anything already
+   * queued — losing queued notices on shutdown is acceptable, but losing
+   * them on a model switch is not.
    *
    * @param {boolean} enabled
    */
@@ -289,10 +346,9 @@ export class GlmQuotaWatcher {
       this.runActive = false;
       this.ownerTriggered = false;
       this.peakWarnedThisRun = false;
+      this.flushNotices();
     } else {
-      // Gated on at startup: do one quota fetch so a daemon that restarted
-      // mid-outage arms the watcher immediately.
-      void this.checkAndMaybeArm(false);
+      this.startPoller(true);
     }
   }
 
@@ -315,11 +371,14 @@ export class GlmQuotaWatcher {
     this.ownerTriggered = false;
     this.peakWarnedThisRun = false;
     this.clearPeakOpenTimer();
+    this.flushNotices();
   }
 
   /**
    * Called when a Pi error event (`auto_retry_end`/`compaction_end`) looks
-   * like a quota failure. Arms the poller (idempotent) when enabled.
+   * like a quota failure. Ensures the sampler is running (idempotent) and
+   * forces an immediate sample so the exhaustion notice is driven by the
+   * authoritative API state, not the sampler's cadence.
    *
    * @param {string} errorMessage
    */
@@ -329,7 +388,8 @@ export class GlmQuotaWatcher {
     this.log.log(
       `pi-lxmf: GLM quota error detected, polling for recovery: ${errorMessage}`,
     );
-    void this.checkAndMaybeArm(true);
+    this.startPoller();
+    void this.tick();
   }
 
   /**
@@ -341,114 +401,144 @@ export class GlmQuotaWatcher {
   }
 
   /**
-   * Fetches the quota once and arms the poller if the 5h bucket is
-   * exhausted. When `fromError` is true (we were tipped off by a Pi error),
-   * arm even if the first fetch is inconclusive (transient API failure).
+   * Starts the sampler if not already running. `immediate` also fires one
+   * sample right away (startup, model switch, quota error) instead of
+   * waiting a full interval.
    *
-   * @param {boolean} fromError
-   * @returns {Promise<void>}
+   * @param {boolean} [immediate]
+   * @private
    */
-  async checkAndMaybeArm(fromError) {
+  startPoller(immediate) {
+    if (this.pollTimer || !this.enabled || !this.apiKey) return;
+    this.pollTimer = setInterval(() => void this.tick(), this.pollIntervalMs);
+    if (typeof this.pollTimer.unref === "function") this.pollTimer.unref();
+    if (immediate) void this.tick();
+  }
+
+  /**
+   * One sampler tick: fetch quota, evaluate bucket transitions, queue
+   * notices for anything new.
+   *
+   * @private
+   */
+  async tick() {
     if (!this.enabled || !this.apiKey) return;
     let quota = null;
     try {
       quota = await fetchQuota(this.apiKey, { fetchImpl: this.fetchImpl });
-    } catch (e) {
-      if (fromError) {
-        // A Pi error said quota-exhausted; trust it and arm, polling will
-        // confirm the recovery transition.
-        this.log.log(
-          `pi-lxmf: GLM quota fetch failed (${e instanceof Error ? e.message : e}); arming watcher on Pi error signal`,
-        );
-        this.armWatcher(0);
-      }
+    } catch {
+      /* transient — retry on the next tick */
       return;
     }
+    this.evaluateSample(quota);
+  }
+
+  /**
+   * Turns a fresh quota sample into (at most one) queued notice, based on
+   * per-bucket window/episode transitions.
+   *
+   * @param {{fiveHour?: BucketSample|null, weekly?: BucketSample|null}} quota
+   * @private
+   */
+  evaluateSample(quota) {
     const pct = quota.fiveHour?.percentage ?? 0;
-    if (pct >= EXHAUSTED_PERCENTAGE) {
-      this.armWatcher(pct);
-    } else if (this.wasExhausted) {
-      // Recovered between fetches (e.g. daemon was away): notify now.
-      this.notifyRecovered(quota);
-    }
-  }
+    const weeklyPct = quota.weekly?.percentage ?? 0;
+    const exhausted = pct >= EXHAUSTED_PERCENTAGE;
+    const weeklyExhausted = weeklyPct >= EXHAUSTED_PERCENTAGE;
 
-  /**
-   * Arms the single poller (idempotent). Records the episode start time on
-   * the first arm of an episode and resets the per-episode notification flag.
-   *
-   * @param {number} percentage
-   */
-  armWatcher(percentage) {
-    if (!this.wasExhausted) {
-      this.wasExhausted = true;
-      this.exhaustedSinceMs = this.now();
-      this.notifiedThisEpisode = false;
-      this.log.log(
-        `pi-lxmf: GLM 5h quota exhausted (${percentage}%) — will notify on recovery`,
-      );
-    }
-    this.startPoller();
-  }
+    /** @type {string[]} */
+    const lines = [];
 
-  /** Starts the poller if not already running. */
-  startPoller() {
-    if (this.pollTimer || !this.enabled || !this.apiKey) return;
-    const apiKey = this.apiKey;
-    const tick = async () => {
-      try {
-        const quota = await fetchQuota(apiKey, {
-          fetchImpl: this.fetchImpl,
-        });
-        const pct = quota.fiveHour?.percentage ?? 0;
-        if (pct < EXHAUSTED_PERCENTAGE && this.wasExhausted) {
-          this.notifyRecovered(quota);
-        }
-      } catch {
-        /* transient — retry on the next tick */
+    // --- 5h bucket ------------------------------------------------------
+    if (exhausted) {
+      if (!this.wasExhausted) {
+        // New exhausted episode: stamp it, re-arm its notices.
+        this.wasExhausted = true;
+        this.exhaustedSinceMs = this.now();
+        this.exhaustionNotified.fiveHour = false;
+        // Suppress the 90% warning for the rest of this window: the
+        // exhaustion (and its recovery) notices say everything already.
+        this.warned.fiveHour = true;
       }
-    };
-    this.pollTimer = setInterval(() => void tick(), this.pollIntervalMs);
-    if (typeof this.pollTimer.unref === "function") this.pollTimer.unref();
-  }
+      if (!this.exhaustionNotified.fiveHour) {
+        this.exhaustionNotified.fiveHour = true;
+        lines.push(
+          `⚠️ GLM 5h quota exhausted (100%)${resetSuffix(quota.fiveHour?.nextResetMs, this.now())}`,
+        );
+      }
+    } else {
+      if (this.wasExhausted) {
+        // Recovered below 100% after an exhausted episode (once per episode).
+        this.wasExhausted = false;
+        const elapsed = this.exhaustedSinceMs
+          ? this.now() - this.exhaustedSinceMs
+          : 0;
+        lines.push(
+          `✅ GLM 5h quota available again${elapsed > 0 ? ` (was exhausted for ~${formatElapsed(elapsed)})` : ""}. Weekly: ${weeklyPct}%.`,
+        );
+      }
+      if (pct < this.warnPercentage) {
+        // Below the threshold: re-arm the warning for the next window.
+        this.warned.fiveHour = false;
+      } else if (!this.warned.fiveHour) {
+        // At-or-above the threshold but not exhausted: warn once per window
+        // (a dip below the threshold re-arms the warning).
+        this.warned.fiveHour = true;
+        lines.push(`⚠️ GLM 5h quota at ${pct}% — getting close.`);
+      }
+    }
 
-  /** Stops the poller. */
-  stopPoller() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    // --- weekly bucket ----------------------------------------------------
+    if (weeklyExhausted) {
+      if (!this.exhaustionNotified.weekly) {
+        this.exhaustionNotified.weekly = true;
+        this.warned.weekly = false;
+        lines.push(
+          `⚠️ GLM weekly quota exhausted (100%)${resetSuffix(quota.weekly?.nextResetMs, this.now())}`,
+        );
+      }
+    } else if (weeklyPct >= this.warnPercentage && !this.warned.weekly) {
+      this.warned.weekly = true;
+      lines.push(`⚠️ GLM weekly quota at ${weeklyPct}% — getting close.`);
+    } else if (weeklyPct < this.warnPercentage) {
+      this.warned.weekly = false;
+    }
+
+    if (lines.length > 0) {
+      this.log.log(`pi-lxmf: GLM quota notice: ${lines.join(" | ")}`);
+      this.queueNotice(lines.join("\n"));
     }
   }
 
   /**
-   * Delivers the one-shot recovery notification and stops the poller.
+   * Queues a notice; queued notices are delivered when the bridge is idle
+   * or, during a live owner-triggered run, on `agent_settled` (never
+   * interleaving with a reply mid-run).
    *
-   * @param {{fiveHour?: {percentage: number}|null, weekly?: {percentage: number}|null, level?: string|null}} quota
+   * @param {string} text
+   * @private
    */
-  async notifyRecovered(quota) {
-    if (this.notifiedThisEpisode) return;
-    this.notifiedThisEpisode = true;
-    this.wasExhausted = false;
-    this.stopPoller();
-    const elapsed = this.exhaustedSinceMs
-      ? this.now() - this.exhaustedSinceMs
-      : 0;
-    const weeklyPct = quota.weekly?.percentage;
-    const level = quota.level ? `GLM ${quota.level}` : "GLM";
-    const parts = [`${level} 5h quota available again`];
-    if (elapsed > 0) {
-      parts.push(`(was exhausted for ~${formatElapsed(elapsed)})`);
-    }
-    if (typeof weeklyPct === "number") {
-      parts.push(`Weekly: ${weeklyPct}%`);
-    }
-    try {
-      await this.sendText(this.ownerDestinationHash, parts.join(" "));
-    } catch (e) {
+  queueNotice(text) {
+    this.pendingNotices.push(text);
+    this.flushNotices();
+  }
+
+  /**
+   * Delivers queued notices as one message, when no owner-triggered run
+   * is live. Delivery is best-effort; a failure is logged once.
+   *
+   * @private
+   */
+  flushNotices() {
+    if (this.pendingNotices.length === 0) return;
+    if (this.runActive && this.ownerTriggered) return;
+    const text = this.pendingNotices.join("\n\n");
+    this.pendingNotices = [];
+    this.sendText(this.ownerDestinationHash, text).catch((e) => {
       this.log.error(
         `pi-lxmf: GLM quota notification delivery failed: ${e instanceof Error ? e.message : e}`,
       );
-    }
+    });
   }
 
   /**
@@ -500,6 +590,27 @@ export class GlmQuotaWatcher {
       this.peakOpenTimer = null;
     }
   }
+
+  /** Stops the sampler. */
+  stopPoller() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+}
+
+/**
+ * Human-readable "resets in" suffix from a bucket's `nextResetMs`.
+ *
+ * @param {number|undefined} nextResetMs
+ * @param {number} nowMs
+ * @returns {string}
+ */
+function resetSuffix(nextResetMs, nowMs) {
+  if (!nextResetMs || nextResetMs <= nowMs) return "";
+  const ms = nextResetMs - nowMs;
+  return ` — resets in ~${formatElapsed(ms)}`;
 }
 
 /** @param {number} ms */

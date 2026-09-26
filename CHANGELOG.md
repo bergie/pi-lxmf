@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Quota exhaustion and 90% warnings** (work doc #3): the GLM quota
+  watcher now samples the z.ai quota API continuously while a GLM model
+  is active (not just after a run fails) and notifies the owner when a
+  bucket (5h or weekly) hits 100% — including at startup, when the daemon
+  starts mid-outage — and when one crosses 90%. The startup check runs
+  immediately on enable, so no error is needed to detect an exhausted
+  bucket.
+- The startup notification now names the active model (fresh `get_state`
+  observation) — the model isn't visible anywhere else over LXMF.
+- `/model` and `/think` re-observe state right away, so the quota watcher
+  gate follows the switch immediately instead of on the next prompt.
+
+### Fixed
+
+- A run that failed after delivering partial output silently trailed
+  off: the error is now reported as a "run ended early" message and no
+  longer leaks into a later exchange's failure reply.
+
 ## [0.1.3] - 2026-09-27
 
 ### Changed

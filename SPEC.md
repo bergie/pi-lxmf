@@ -308,19 +308,30 @@ the recently used ones (derived from the per-workdir session pointers);
 ### 6.7 z.ai GLM quota watcher and peak-hours warning
 
 When the active model is a z.ai GLM model (`provider === "zai"`), the bridge
-runs a `GlmQuotaWatcher` (`src/quota.js`) that does two things, both gated
-on the active model being GLM — nothing fires for non-z.ai providers (e.g.
-Cortecs, Anthropic):
+runs a `GlmQuotaWatcher` (`src/quota.js`), gated on the active model being
+GLM — nothing fires for non-z.ai providers (e.g. Cortecs, Anthropic). The
+gate is (re-)evaluated on every `get_state` observation: prompts, the
+startup observation, and after `/model`/`/think` commands.
 
-- **Quota-recovery notification.** When a run fails with a z.ai
-  quota-exhausted error (matched from `auto_retry_end`/`compaction_end`
-  error messages), the watcher polls the same z.ai quota endpoint
-  `pi-glm-usage` uses (`https://api.z.ai/api/monitor/usage/quota/limit`,
-  Bearer `~/.pi/agent/auth.json` → `zai.key`, honouring `PI_AUTH_DIR`) every
-  60s and delivers **exactly one** LXMF message to the owner the moment
-  the 5h bucket drops below 100%. One notification per exhausted episode;
-  rate-limit-only errors (transient, retried by Pi) do not arm it. A
-  missing `zai.key` disables the watcher gracefully (logged once).
+- **Continuous quota sampling.** While enabled, the watcher polls the
+  same z.ai quota endpoint `pi-glm-usage` uses
+  (`https://api.z.ai/api/monitor/usage/quota/limit`, Bearer
+  `~/.pi/agent/auth.json` → `zai.key`, honouring `PI_AUTH_DIR`) every 60s
+  (first sample immediately on enable — so a daemon that starts mid-outage
+  detects and reports it right away). From those samples the owner is
+  notified of:
+  - **Exhaustion** — a bucket (5h or weekly) reaching 100%: once per
+    episode, with the reset time when the API reports one.
+  - **90% warning** — a bucket at or above 90% while below 100%: once
+    per window (a dip below the threshold re-arms it).
+  - **Recovery** — the 5h bucket dropping below 100% after an exhausted
+    episode: once per episode.
+  A quota-looking Pi error (`auto_retry_end`/`compaction_end`) forces an
+  immediate fresh sample; rate-limit-only errors (transient, retried by
+  Pi) are ignored. Per-sample notices are joined into one LXMF message
+  and — when an owner-triggered run is live — deferred to `agent_settled`
+  so they never interleave with a reply. A missing `zai.key` disables the
+  watcher gracefully (logged once).
 - **Peak-hours warning.** z.ai charges 3× tokens Mon–Fri 14:00–18:00
   Singapore Standard Time (UTC+8). The owner is warned when an
   owner-triggered run starts inside that window, and when the window

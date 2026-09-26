@@ -315,6 +315,18 @@ export class Bridge {
         this.log.log(`pi-lxmf: inbound from owner: command /${parsed.name}`);
         try {
           const result = await command.run(this.commandContext(), parsed.args);
+          // /model and /think change pi state the bridge tracks through
+          // `get_state` observations — re-observe so the active model (and
+          // the GLM watcher gate) follow immediately instead of on the
+          // next prompt. Other commands manage their own observations
+          // (e.g. /cd) or don't affect tracked state.
+          if (parsed.name === "model" || parsed.name === "think") {
+            try {
+              this.observeState(await this.rpc.getState());
+            } catch {
+              /* keep stale observations; next prompt re-observes */
+            }
+          }
           const text = typeof result === "string" ? result : result?.text;
           if (text) await this.deliver(text);
           if (result && typeof result === "object" && result.shutdown) {
@@ -466,6 +478,14 @@ export class Bridge {
 
     if (sent > 0) {
       this.recovering = false;
+      // The owner already got (partial) output. A trailing failure means
+      // the run died mid-reply: say so — otherwise the exchange just
+      // trails off — and never let the error leak into a later exchange.
+      if (this.lastError) {
+        const error = this.lastError;
+        this.lastError = null;
+        await this.deliver(`⚠️ run ended early: ${error}`);
+      }
       return;
     }
     if (this.lastError) {
@@ -655,17 +675,29 @@ export class Bridge {
    * Tells the owner the bridge has started and is accepting messages
    * (the startup case of SPEC §13 proactive notifications). Called by the
    * daemon once the mesh side is announcing and the RPC child is ready.
-   * Best-effort via {@link deliver}: a failure is noted and carried by
-   * the next successful delivery instead of being lost.
+   * The active model is included (fresh `get_state` observation) — the
+   * owner can't see the TUI footer over LXMF, so the startup message is
+   * the only place the model is announced proactively. Best-effort via
+   * {@link deliver}: a failure is noted and carried by the next
+   * successful delivery instead of being lost.
    *
    * @param {string|null} [resumedSessionFile] - Absolute path of the
    *   session resumed from the persisted pointer, when one exists.
    */
   async notifyStartup(resumedSessionFile = null) {
-    const resumed = resumedSessionFile
-      ? `\nResuming session ${basename(resumedSessionFile)}.`
-      : "";
-    await this.deliver(`🟢 pi-lxmf ready — listening for messages.${resumed}`);
+    try {
+      this.observeState(await this.rpc.getState());
+    } catch {
+      /* RPC child is ready (checked by the caller); keep the old model */
+    }
+    const lines = ["🟢 pi-lxmf ready — listening for messages."];
+    if (typeof this.activeModel?.name === "string" && this.activeModel.name) {
+      lines.push(`Model: ${this.activeModel.name}`);
+    }
+    if (resumedSessionFile) {
+      lines.push(`Resuming session ${basename(resumedSessionFile)}.`);
+    }
+    await this.deliver(lines.join("\n"));
   }
 
   /**
