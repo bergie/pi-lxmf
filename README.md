@@ -88,9 +88,10 @@ node src/bin.js --help
 |---|---|
 | plain text | a prompt to the agent (steered into a running turn by default) |
 | `/help` | bridge commands + Pi commands available via prompt |
-| `/status` | model, thinking, session, uptime, node + owner identity hashes |
+| `/status` | model, thinking, session, uptime, cwd + workdir, node + owner identity hashes |
 | `/session` | message counts, tokens, cost, context usage |
 | `/new` | fresh Pi session |
+| `/cd [path]` | switch the supervised Pi to another repo under `workdir`; bare `/cd` lists current + recent repos |
 | `/name [name]` | show / set the session display name |
 | `/compact [instructions]` | compact the conversation context |
 | `/model [query]` | list models, or switch (`/model sonnet`) |
@@ -105,6 +106,15 @@ Replies are delivered per finished assistant message, chunked to fit
 then a `✅ done (no reply)` nudge. Extension dialogs raised inside Pi are
 auto-declined (nobody is at a terminal) and reported to you.
 
+`/cd` makes one bridge serve every repo under `workdir`: switching is a
+supervised respawn in the target directory (messages queue during the switch),
+each repo keeps its own Pi session — revisiting one resumes its conversation —
+and the active repo is remembered across daemon restarts. Targets must resolve
+under `workdir` (no `..` traversal, nothing outside the tree); anything else
+is refused without touching the child. `/status` shows the current `cwd` and
+`workdir`, and each switched-to project must be trusted once (see step 4
+above) for its local `.pi` resources to load.
+
 ## Configuration
 
 `~/.config/pi-lxmf/config.json` (XDG env vars respected). A missing file runs
@@ -114,7 +124,7 @@ on defaults.
 |---|---|---|
 | `owner` | *(required)* | the owner's 32-hex **Reticulum identity hash** (not the LXMF address); the daemon derives the `lxmf.delivery` destination hash for wire comparison |
 | `name` | `pi-lxmf <version>` | announce display name |
-| `workdir` | daemon cwd | project directory Pi runs in (also where `AGENTS.md` is found) |
+| `workdir` | daemon cwd | project directory Pi runs in (also where `AGENTS.md` is found); the trust root `/cd` cannot escape |
 | `model` | Pi default | `--model` pattern passed to Pi |
 | `piBin` | `pi` | Pi binary |
 | `dataDir` | `~/.local/share/pi-lxmf` | state root (see below) |
