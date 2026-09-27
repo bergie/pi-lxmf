@@ -581,8 +581,8 @@ test("chat commands run without an LLM turn", async () => {
 
   mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/help" });
   await bridge.queue;
-  assert.match(lastSent(mesh), /\/skill:review — Review code/);
-  assert.match(lastSent(mesh), /! \(bare\) — quick interrupt/);
+  assert.match(lastSent(mesh), /^- `\/skill:review` — Review code$/m);
+  assert.match(lastSent(mesh), /^- `!` \(bare\) — quick interrupt$/m);
 
   mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/quit" });
   await bridge.queue;
@@ -636,9 +636,9 @@ test("/cd switches the supervised Pi into another repo and resumes its session",
     assert.equal(rpc.sessionPath, "/sessions/repo-b.jsonl");
     assert.equal(bridge.currentCwd, repoB);
     assert.equal(state.savedCwd, repoB);
-    assert.match(lastSent(mesh), /^📂 ─+$/m);
-    assert.match(lastSent(mesh), /📂 Switched to repo-b/);
-    assert.match(lastSent(mesh), /🔁 Resuming session repo-b\.jsonl/);
+    assert.match(lastSent(mesh), /^---$/m);
+    assert.match(lastSent(mesh), /📂 Switched to `repo-b`/);
+    assert.match(lastSent(mesh), /🔁 Resuming session `repo-b\.jsonl`/);
     // The resumed session observation persists under ITS workdir key.
     assert.equal(state.sessions[repoB], "/sessions/repo-b.jsonl");
   } finally {
@@ -661,7 +661,7 @@ test("/cd into a repo without a pointer starts a fresh session", async () => {
     assert.deepEqual(rpc.cwdSwitches, [repoC]);
     assert.equal(rpc.sessionPath, "/sessions/current.jsonl"); // the fresh session observed after the switch
     assert.equal(state.savedCwd, repoC);
-    assert.match(lastSent(mesh), /📂 Switched to repo-c/);
+    assert.match(lastSent(mesh), /📂 Switched to `repo-c`/);
     assert.match(lastSent(mesh), /✨ Fresh session/);
     // The fresh session (reported by get_state) persists under repo-c's key.
     assert.equal(state.sessions[repoC], "/sessions/current.jsonl");
@@ -686,7 +686,7 @@ test("/cd refuses paths outside the workdir without touching the child", async (
   assert.equal(rpc.sessionPath, null); // refusals never touch the child
   assert.equal(state.savedCwd, null);
   for (const sent of mesh.sent) {
-    assert.match(sent.text, /not a directory under \/workspace/);
+    assert.match(sent.text, /not a directory under `\/workspace`/);
   }
 });
 
@@ -723,10 +723,10 @@ test("/cd without arguments lists the current and recent repos", async () => {
     assert.deepEqual(rpc.cwdSwitches, []);
     const text = lastSent(mesh);
     assert.ok(
-      text.startsWith(`cwd: . (${root})\n`),
+      text.startsWith(`**Repos**\n\n- Current: \`.\` (\`${root}\`)\n`),
       `unexpected repo list: ${text}`,
     );
-    assert.match(text, /recent:/);
+    assert.match(text, /^- Recent: `repo-b`$/m);
     assert.match(text, /repo-b/);
     assert.doesNotMatch(text, /somewhere/);
     assert.doesNotMatch(text, /legacy/);
@@ -760,7 +760,7 @@ test("/cd mid-run closes the exchange without empty-tail recovery", async () => 
     rpc.emitEvent({ type: "agent_settled" });
     await sleep(10);
     assert.equal(rpc.prompts.length, 1); // just the original prompt
-    assert.match(lastSent(mesh), /📂 Switched to repo-b/);
+    assert.match(lastSent(mesh), /📂 Switched to `repo-b`/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -770,8 +770,8 @@ test("/status shows the current cwd and workdir", async () => {
   const { bridge, mesh } = makeBridge({ owner: OWNER });
   mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/status" });
   await bridge.queue;
-  assert.match(lastSent(mesh), /cwd: \/workspace/);
-  assert.match(lastSent(mesh), /workdir: \/workspace/);
+  assert.match(lastSent(mesh), /- Cwd: `\/workspace`/);
+  assert.match(lastSent(mesh), /- Workdir: `\/workspace`/);
 });
 
 test("failed LXMF delivery is noted on the next message", async () => {

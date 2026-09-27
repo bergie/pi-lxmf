@@ -97,7 +97,9 @@ export function matchModel(models, query) {
 }
 
 /**
- * Formats the model list with the current model marked.
+ * Formats the model list with the current model marked. Markdown: every
+ * outbound message carries `FIELD_RENDERER: RENDERER_MARKDOWN` (§5.1),
+ * so replies render as such in Sideband/NomadNet.
  *
  * @param {Array<{id?: string, provider?: string, name?: string}>} models
  * @param {{provider?: string, id?: string}|null} current
@@ -110,15 +112,15 @@ export function formatModelList(models, current) {
       : null;
   const lines = models.map((m) => {
     const key = `${m.provider}/${m.id}`;
-    const marker = key.toLowerCase() === currentKey ? " ← current" : "";
+    const marker = key.toLowerCase() === currentKey ? " ← **current**" : "";
     const name = m.name && m.name !== m.id ? ` — ${m.name}` : "";
-    return `${key}${name}${marker}`;
+    return `- \`${key}\`${name}${marker}`;
   });
-  return [`Models (${models.length}):`, ...lines].join("\n");
+  return [`**Models (${models.length})**`, "", ...lines].join("\n");
 }
 
 /**
- * Formats `get_state` + bridge info as the `/status` reply.
+ * Formats `get_state` + bridge info as the `/status` reply (Markdown).
  *
  * @param {any} state - `get_state` data.
  * @param {object} bridgeInfo
@@ -132,28 +134,30 @@ export function formatModelList(models, current) {
  */
 export function formatStatus(state, bridgeInfo) {
   const model = state?.model
-    ? `${state.model.provider}/${state.model.id}`
+    ? `\`${state.model.provider}/${state.model.id}\``
     : "(none)";
   const session = state?.sessionFile
-    ? `${state.sessionName ?? "(unnamed)"} · ${basename(state.sessionFile)}`
+    ? `${state.sessionName ?? "(unnamed)"} (\`${basename(state.sessionFile)}\`)`
     : "(none)";
   return [
-    `model: ${model}`,
-    `thinking: ${state?.thinkingLevel ?? "off"}`,
-    `busy: ${state?.isStreaming ? "yes" : "no"}`,
-    `session: ${session}`,
-    `cwd: ${bridgeInfo.cwd ?? "?"}`,
-    `workdir: ${bridgeInfo.workdir ?? "?"}`,
-    `node: ${bridgeInfo.identityHash}`,
-    `lxmf: ${bridgeInfo.deliveryHash}`,
-    `owner (identity): ${bridgeInfo.owner ?? "?"}`,
-    `uptime: ${formatDuration(bridgeInfo.uptimeMs)}`,
+    "**Status**",
+    "",
+    `- Model: ${model}`,
+    `- Thinking: ${state?.thinkingLevel ?? "off"}`,
+    `- Busy: ${state?.isStreaming ? "yes" : "no"}`,
+    `- Session: ${session}`,
+    `- Cwd: \`${bridgeInfo.cwd ?? "?"}\``,
+    `- Workdir: \`${bridgeInfo.workdir ?? "?"}\``,
+    `- Node: \`${bridgeInfo.identityHash}\``,
+    `- LXMF: \`${bridgeInfo.deliveryHash}\``,
+    `- Owner: \`${bridgeInfo.owner ?? "?"}\``,
+    `- Uptime: ${formatDuration(bridgeInfo.uptimeMs)}`,
   ].join("\n");
 }
 
 /**
  * Formats the `/cd` (no arguments) reply: the current repo and the
- * recently used repos under the daemon workdir.
+ * recently used repos under the daemon workdir (Markdown).
  *
  * @param {object} bridgeInfo
  * @param {string} bridgeInfo.workdir
@@ -164,19 +168,21 @@ export function formatStatus(state, bridgeInfo) {
 export function formatRepoList(bridgeInfo) {
   const workdir = bridgeInfo.workdir;
   const cwd = bridgeInfo.cwd ?? workdir;
-  const lines = [`cwd: ${relative(workdir, cwd) || "."} (${cwd})`];
+  const lines = [
+    "**Repos**",
+    "",
+    `- Current: \`${relative(workdir, cwd) || "."}\` (\`${cwd}\`)`,
+  ];
   const recent = bridgeInfo.recentWorkdirs ?? [];
-  if (recent.length === 0) {
-    lines.push("recent: (none)");
-  } else {
-    lines.push("recent:");
-    for (const w of recent) lines.push(`  ${relative(workdir, w) || "."}`);
-  }
+  const names = recent.map((w) => `\`${relative(workdir, w) || "."}\``);
+  lines.push(
+    names.length > 0 ? `- Recent: ${names.join(", ")}` : "- Recent: (none)",
+  );
   return lines.join("\n");
 }
 
 /**
- * Formats `get_session_stats` data as the `/session` reply.
+ * Formats `get_session_stats` data as the `/session` reply (Markdown).
  *
  * @param {any} stats
  * @returns {string}
@@ -184,10 +190,12 @@ export function formatRepoList(bridgeInfo) {
 export function formatSessionStats(stats) {
   if (!stats) return "No session stats available.";
   return [
-    `messages: ${stats.userMessages ?? 0} in / ${stats.assistantMessages ?? 0} out` +
+    "**Session**",
+    "",
+    `- Messages: ${stats.userMessages ?? 0} in / ${stats.assistantMessages ?? 0} out` +
       ` (${stats.toolCalls ?? 0} tool calls)`,
-    `usage: ${formatTokens(stats)}`,
-    `session: ${stats.sessionId ?? "?"}`,
+    `- Usage: ${formatTokens(stats)}`,
+    `- Session: \`${stats.sessionId ?? "?"}\``,
   ].join("\n");
 }
 
@@ -217,7 +225,7 @@ export const bridgeCommands = {
     description: "List bridge commands",
     async run(ctx) {
       const mine = Object.entries(bridgeCommands).map(
-        ([name, def]) => `/${name} — ${def.description}`,
+        ([name, def]) => `- \`/${name}\` — ${def.description}`,
       );
       /** @type {string[]} */
       let piCommands = [];
@@ -225,17 +233,22 @@ export const bridgeCommands = {
         const commands = await ctx.rpc.getCommands();
         piCommands = commands.map(
           (/** @type {{name?: string, description?: string}} */ c) =>
-            `/${c.name}${c.description ? ` — ${c.description}` : ""}`,
+            `- \`/${c.name}\`${c.description ? ` — ${c.description}` : ""}`,
         );
       } catch {
         /* pi unavailable: bridge commands still listed */
       }
       const parts = [
-        ["Bridge commands:", ...mine, "! (bare) — quick interrupt"].join("\n"),
+        [
+          "**Bridge commands**",
+          "",
+          ...mine,
+          "- `!` (bare) — quick interrupt",
+        ].join("\n"),
       ];
       if (piCommands.length > 0) {
         parts.push(
-          ["Pi commands (sent as prompts):", ...piCommands].join("\n"),
+          ["**Pi commands** (sent as prompts)", "", ...piCommands].join("\n"),
         );
       }
       parts.push("Anything else is sent to the agent as a prompt.");
@@ -274,7 +287,7 @@ export const bridgeCommands = {
       const target = resolveCwdTarget(ctx.workdir, args);
       if (!target) {
         ctx.log?.(`pi-lxmf: /cd refused: ${args} not under workdir`);
-        return `⚠️ /cd refused: "${args}" is not a directory under ${ctx.workdir}.`;
+        return `⚠️ /cd refused: "${args}" is not a directory under \`${ctx.workdir}\`.`;
       }
       if (target === ctx.getBridgeInfo().cwd) {
         return `Already in ${target}.`;
@@ -331,7 +344,7 @@ export const bridgeCommands = {
       const levels = await ctx.rpc.getAvailableThinkingLevels();
       const level = (args || "").toLowerCase();
       if (!level || !levels.includes(level)) {
-        return `Thinking levels: ${levels.join(", ")} (current model).`;
+        return `Thinking levels: ${levels.map((l) => `\`${l}\``).join(", ")} (current model).`;
       }
       await ctx.rpc.setThinkingLevel(level);
       return `Thinking level set to ${level}.`;

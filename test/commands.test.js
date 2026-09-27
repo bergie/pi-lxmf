@@ -70,8 +70,12 @@ test("formatModelList marks the current model", () => {
     { provider: "openai", id: "gpt-5.2", name: "GPT-5.2" },
   ];
   const text = formatModelList(models, { provider: "openai", id: "gpt-5.2" });
-  assert.match(text, /anthropic\/claude-sonnet-4-5 — Claude Sonnet 4\.5$/m);
-  assert.match(text, /openai\/gpt-5\.2.*← current/m);
+  assert.match(text, /^\*\*Models \(2\)\*\*$/m);
+  assert.match(
+    text,
+    /^- `anthropic\/claude-sonnet-4-5` — Claude Sonnet 4\.5$/m,
+  );
+  assert.match(text, /^- `openai\/gpt-5\.2`.*← \*\*current\*\*$/m);
 });
 
 test("isUnderWorkdir accepts the tree itself and descendants only", () => {
@@ -116,12 +120,12 @@ test("formatRepoList shows the current repo and recent repos", () => {
     cwd: "/w/a",
     recentWorkdirs: ["/w/b", "/w/a/b"],
   });
-  assert.match(text, /cwd: a \(\/w\/a\)/);
-  assert.match(text, /recent:\n {2}b\n {2}a\/b/);
+  assert.match(text, /^- Current: `a` \(`\/w\/a`\)$/m);
+  assert.match(text, /^- Recent: `b`, `a\/b`$/m);
 
   assert.equal(
     formatRepoList({ workdir: "/w", cwd: null, recentWorkdirs: [] }),
-    ["cwd: . (/w)", "recent: (none)"].join("\n"),
+    ["**Repos**", "", "- Current: `.` (`/w`)", "- Recent: (none)"].join("\n"),
   );
 });
 
@@ -143,11 +147,12 @@ test("formatStatus and formatSessionStats", () => {
       cwd: "/w/a",
     },
   );
-  assert.match(status, /model: anthropic\/claude-sonnet-4-5/);
-  assert.match(status, /session: fix-the-build · abc\.jsonl/);
-  assert.match(status, /cwd: \/w\/a/);
-  assert.match(status, /workdir: \/w/);
-  assert.match(status, /uptime: 1h/);
+  assert.match(status, /^\*\*Status\*\*$/m);
+  assert.match(status, /^- Model: `anthropic\/claude-sonnet-4-5`$/m);
+  assert.match(status, /^- Session: fix-the-build \(`abc\.jsonl`\)$/m);
+  assert.match(status, /^- Cwd: `\/w\/a`$/m);
+  assert.match(status, /^- Workdir: `\/w`$/m);
+  assert.match(status, /^- Uptime: 1h$/m);
 
   const stats = formatSessionStats({
     userMessages: 3,

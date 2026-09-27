@@ -182,9 +182,9 @@ example:
   `[… n/N]` except the last. Chunking keeps single LXMF messages
   reasonable for phone UIs and for mesh airtime.
 - **Content format:** every chunk carries the LXMF `FIELD_RENDERER` field
-  set to `RENDERER_MARKDOWN` (§5.9.4), since pi's replies are Markdown —
-  clients (Sideband, NomadNet) use it to render them instead of showing
-  raw markup as plain text.
+  set to `RENDERER_MARKDOWN` (§5.9.4), since pi's replies and the bridge
+  command replies are Markdown — clients (Sideband, NomadNet) use it to
+  render them instead of showing raw markup as plain text.
 - **Errors:** failures to deliver a reply are logged and retried once;
   persistent failure is reported in the next successful message (LXMF has
   no channel over which to report its own failure).
@@ -367,7 +367,9 @@ in one place so it can be retargeted per subtree.
 
 Command parsing: first whitespace-separated token, case-insensitive,
 leading `!` equivalent to `/` for bridge commands (a bare `!` is the
-interrupt). Commands are recognized only from the owner.
+interrupt). Commands are recognized only from the owner. Command replies
+are Markdown-formatted (§5.1): section headings, bullet lists, code spans
+around commands, models, paths and hashes.
 
 ## 8. Configuration and state
 

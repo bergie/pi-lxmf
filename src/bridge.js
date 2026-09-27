@@ -634,11 +634,13 @@ export class Bridge {
     const rel = relative(this.config.workdir, absPath) || ".";
     // A visually loud banner: project changes are the main boundaries
     // in the message history, so they must be easy to spot while
-    // scrolling back.
-    const lines = ["📂 ───────────────────", `📂 Switched to ${rel}`];
+    // scrolling back. Replies are Markdown on the wire (§5.1), so the
+    // separator is a horizontal rule and the headline bold.
+    const lines = ["---", "", `**📂 Switched to \`${rel}\`**`];
     lines.push(
+      "",
       pointer
-        ? `🔁 Resuming session ${basename(pointer.sessionFile)}`
+        ? `🔁 Resuming session \`${basename(pointer.sessionFile)}\``
         : "✨ Fresh session",
     );
     return lines.join("\n");

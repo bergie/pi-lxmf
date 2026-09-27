@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bridge command replies (especially `/help`, `/status`, `/session`,
+  `/model`, `/cd`) are now authored in Markdown — section headings, bullet
+  lists and code spans around commands, models, paths and hashes — matching
+  the content-format metadata (`FIELD_RENDERER: RENDERER_MARKDOWN`) every
+  outbound message already carries, so they render nicely in Sideband and
+  NomadNet instead of as plain text.
+- The `/cd` switch banner uses a Markdown horizontal rule and a bold
+  headline instead of a `📂 ───` decoration line.
+
 ## [0.2.1] - 2026-09-28
 
 ### Added
