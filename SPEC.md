@@ -181,6 +181,10 @@ example:
   paragraph boundaries where possible, each chunk suffixed
   `[… n/N]` except the last. Chunking keeps single LXMF messages
   reasonable for phone UIs and for mesh airtime.
+- **Content format:** every chunk carries the LXMF `FIELD_RENDERER` field
+  set to `RENDERER_MARKDOWN` (§5.9.4), since pi's replies are Markdown —
+  clients (Sideband, NomadNet) use it to render them instead of showing
+  raw markup as plain text.
 - **Errors:** failures to deliver a reply are logged and retried once;
   persistent failure is reported in the next successful message (LXMF has
   no channel over which to report its own failure).

@@ -54,6 +54,20 @@ export function isUnknownIdentityError(e) {
 }
 
 /**
+ * Builds the fields map signaling the outbound message content format
+ * (FIELD_RENDERER, SPEC §5.9.4): pi's replies are Markdown, and clients
+ * such as Sideband only render them as such when the field says so —
+ * without it they show raw `**bold**`/backtick fences as plain text.
+ *
+ * @returns {Map<number, number>} `{FIELD_RENDERER: RENDERER_MARKDOWN}`
+ */
+export function contentFields() {
+  const fields = new Map();
+  fields.set(LXMFConstants.FIELD_RENDERER, LXMFConstants.RENDERER_MARKDOWN);
+  return fields;
+}
+
+/**
  * Waits until `transport` can recall the identity for `destinationHash`,
  * soliciting it first: a path request makes the destination itself (or any
  * transport node holding its path) announce, and the ingested announce
@@ -526,6 +540,7 @@ export async function startLxmf(config, options = {}) {
         sourceHash: /** @type {Uint8Array} */ (deliveryDest.destinationHash),
         destinationHash: fromHex(destinationHex),
         content,
+        fields: contentFields(),
         ...(i === 0 && sendOptions.title ? { title: sendOptions.title } : {}),
       });
       await sendWithRetry(message, sendOptions.link);

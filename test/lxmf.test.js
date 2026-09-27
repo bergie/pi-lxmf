@@ -9,8 +9,9 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
 import { fromHex } from "@reticulum/core";
-
+import { LXMFConstants } from "@reticulum/lxmf";
 import {
+  contentFields,
   createRetrySender,
   isUnknownIdentityError,
   waitForPeerIdentity,
@@ -250,6 +251,18 @@ test("sendWithRetry waits for the propagation node's announce, then submits", as
   assert.deepEqual(transport.pathRequests, [
     "f033f136cdae7691c9cfc35082540832",
   ]);
+});
+
+test("contentFields signals Markdown rendering (FIELD_RENDERER)", () => {
+  const fields = contentFields();
+  assert.equal(fields.size, 1);
+  assert.equal(
+    fields.get(LXMFConstants.FIELD_RENDERER),
+    LXMFConstants.RENDERER_MARKDOWN,
+  );
+  // Wire values per upstream LXMF: field 0x0F, renderer 0x02.
+  assert.equal(LXMFConstants.FIELD_RENDERER, 0x0f);
+  assert.equal(LXMFConstants.RENDERER_MARKDOWN, 0x02);
 });
 
 test("sendWithRetry reports the failure when everything fails", async () => {

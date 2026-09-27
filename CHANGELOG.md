@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Outbound LXMF messages now signal their content format: every content
+  chunk carries the `FIELD_RENDERER` field set to `RENDERER_MARKDOWN`, so
+  clients (Sideband, NomadNet) render pi's Markdown replies correctly
+  instead of showing raw markup as plain text.
+
 ## [0.2.0] - 2026-09-27
 
 ### Added
