@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-03
+
 ### Changed
 
 - Upgraded to reticulum-js 0.9.3 (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/node`) and adopted its API ergonomics: outbound delivery now uses the router's own `send()` escalation (`{ linkId, fallback, solicit, timeoutMs }` — DIRECT link → opportunistic packet with recipient-identity solicitation → propagation store-and-forward), replacing the hand-rolled `waitForPeerIdentity` announce-wait and multi-attempt retry chain in `src/lxmf.js`. The unknown-identity failure is now the typed `UnknownIdentityError` from `@reticulum/core`. `startLxmf` awaits the new `Reticulum.ready()` before loading the node identity.
