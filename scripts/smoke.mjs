@@ -56,8 +56,10 @@ function check(label, ok) {
 
 try {
   // --- The fake pi binary (shell wrapper around fake-pi.mjs) -------------
+  // /bin/sh, not /usr/bin/sh: macOS has no /usr/bin/sh, and a missing
+  // shebang interpreter surfaces as spawn ENOENT on the wrapper.
   const fakePi = join(work, "fake-pi.sh");
-  writeFileSync(fakePi, `#!/usr/bin/sh\nexec node ${root}/fake-pi.mjs "$@"\n`);
+  writeFileSync(fakePi, `#!/bin/sh\nexec node ${root}/fake-pi.mjs "$@"\n`);
   chmodSync(fakePi, 0o755);
 
   // --- The fake owner: a second LXMF node on the same rnsd ----------------
@@ -198,13 +200,13 @@ try {
   const helpUntil = Date.now() + 15000;
   while (
     Date.now() < helpUntil &&
-    !received.some((m) => /Bridge commands:/.test(m.content))
+    !received.some((m) => /Bridge commands/.test(m.content))
   ) {
     await sleep(200);
   }
   check(
     "bridge command /help answered",
-    received.some((m) => /Bridge commands:/.test(m.content)),
+    received.some((m) => /Bridge commands/.test(m.content)),
   );
 
   // --- 3. Chunking ----------------------------------------------------------

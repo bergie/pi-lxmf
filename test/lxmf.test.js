@@ -1,174 +1,77 @@
 /**
  * Smoketests for the outbound delivery machinery in src/lxmf.js: the
- * unknown-identity failure predicate, the path-request/announce wait, and
- * the full `createRetrySender` escalation chain (direct → identity wait →
- * link retry → no-link retry → propagation-node store-and-forward).
+ * typed unknown-identity failure predicate, the send options passed to the
+ * router (reticulum-js 0.9.3's `{ linkId, fallback, solicit, timeoutMs }`
+ * escalation), and the propagation-node recovery in `createRetrySender`.
  */
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
-import { fromHex } from "@reticulum/core";
+import { fromHex, UnknownIdentityError } from "@reticulum/core";
 import { LXMFConstants } from "@reticulum/lxmf";
 import {
   contentFields,
   createRetrySender,
   isUnknownIdentityError,
-  waitForPeerIdentity,
 } from "../src/lxmf.js";
 
 const DEST = fromHex("ac880aeabfa2f2e70dc57a44aaf9f370");
-const OTHER = fromHex("f033f136cdae7691c9cfc35082540832");
+const NODE = fromHex("f033f136cdae7691c9cfc35082540832");
+const NODE_HEX = "f033f136cdae7691c9cfc35082540832";
 
 /**
- * Fake `rns.transport`: an EventTarget whose `recallIdentity` answers only
- * after an announce for that destination has been dispatched (mirrors the
- * real transport, which remembers the identity before dispatching the
- * event). `requestPath` records the call and optionally schedules the
- * announce that a real peer (or a node holding its path) would send.
+ * Fake `rns.transport`: the 0.9.3 solicitation entry point pi-lxmf calls
+ * during propagation-node recovery. The real one path-requests the
+ * destination and resolves on its announce (covered by reticulum-js's own
+ * tests); here it is scripted per test.
  */
-class FakeTransport extends EventTarget {
+class FakeTransport {
   constructor() {
-    super();
-    /** @type {string[]} */
-    this.pathRequests = [];
-    /** @type {Map<string, object>} */
-    this.identities = new Map();
+    /** @type {Array<[Uint8Array, number]>} */
+    this.solicitCalls = [];
+    /** @type {null|((dest: Uint8Array, timeoutMs: number) => Promise<object>)} */
+    this.onSolicit = null;
   }
 
   /**
    * @param {Uint8Array} destinationHash
+   * @param {number} [timeoutMs]
    */
-  async requestPath(destinationHash) {
-    this.pathRequests.push(Buffer.from(destinationHash).toString("hex"));
-  }
-
-  /**
-   * @param {Uint8Array} destinationHash
-   */
-  announce(destinationHash) {
-    this.identities.set(Buffer.from(destinationHash).toString("hex"), {});
-    this.dispatchEvent(
-      new CustomEvent("announce", { detail: { destinationHash } }),
-    );
-  }
-
-  /**
-   * @param {Uint8Array} destinationHash
-   */
-  async recallIdentity(destinationHash) {
-    return (
-      this.identities.get(Buffer.from(destinationHash).toString("hex")) ?? null
-    );
+  async recallOrSolicitIdentity(destinationHash, timeoutMs = 30_000) {
+    this.solicitCalls.push([destinationHash, timeoutMs]);
+    if (this.onSolicit) return this.onSolicit(destinationHash, timeoutMs);
+    return {};
   }
 }
 
-test("isUnknownIdentityError matches only the router's unknown-identity failure", () => {
-  assert.ok(
-    isUnknownIdentityError(
-      new Error(
-        "Cannot deliver: identity for ac880aeabfa2f2e70dc57a44aaf9f370 is unknown",
-      ),
-    ),
-  );
-  assert.ok(!isUnknownIdentityError(new Error("some other failure")));
-  assert.ok(!isUnknownIdentityError("Cannot deliver: identity for …"));
-});
-
-test("waitForPeerIdentity resolves immediately when the identity is already known", async () => {
-  const transport = new FakeTransport();
-  transport.identities.set(Buffer.from(DEST).toString("hex"), {});
-  assert.equal(await waitForPeerIdentity(transport, DEST, 1000), true);
-  assert.equal(transport.pathRequests.length, 0);
-});
-
-test("waitForPeerIdentity solicits the peer and resolves on its announce", async () => {
-  const transport = new FakeTransport();
-  const promise = waitForPeerIdentity(transport, DEST, 2000);
-  // The solicited peer answers with its announce.
-  setTimeout(() => transport.announce(DEST), 5);
-  assert.equal(await promise, true);
-  assert.deepEqual(transport.pathRequests, [
-    "ac880aeabfa2f2e70dc57a44aaf9f370",
-  ]);
-});
-
-test("waitForPeerIdentity ignores announces for other destinations", async () => {
-  const transport = new FakeTransport();
-  const promise = waitForPeerIdentity(transport, DEST, 100);
-  // A different peer announces mid-wait: must not resolve the wait.
-  setTimeout(() => transport.announce(OTHER), 5);
-  assert.equal(await promise, false);
-  assert.deepEqual(transport.pathRequests, [
-    "ac880aeabfa2f2e70dc57a44aaf9f370",
-  ]);
-});
-
-test("waitForPeerIdentity gives up after the timeout", async () => {
-  const transport = new FakeTransport();
-  // requestPath that never gets answered (peer offline).
-  transport.requestPath = async (destinationHash) => {
-    transport.pathRequests.push(Buffer.from(destinationHash).toString("hex"));
-  };
-  assert.equal(await waitForPeerIdentity(transport, DEST, 50), false);
-});
-
 /**
- * Fake `LXMRouter`: scripted `send`/`submitToPropagationNode` outcomes
- * (each call shifts the next `{throw}` or `{ok}`), on a FakeTransport so
- * the announce-wait paths behave like the real mesh stack.
+ * Fake `LXMRouter`: scripted `send` outcomes (each call shifts the next
+ * `{throw}` or `{ok}`), on a FakeTransport for the recovery path.
  */
 class FakeRouter {
   /**
    * @param {object} [options]
    * @param {Array<{throw?: Error, ok?: boolean}>} [options.sendOutcomes]
-   * @param {Array<{throw?: Error, ok?: boolean}>} [options.submitOutcomes]
    */
-  constructor({ sendOutcomes = [], submitOutcomes = [] } = {}) {
+  constructor({ sendOutcomes = [] } = {}) {
     this.rns = { transport: new FakeTransport() };
     /** @type {Array<any[]>} */
     this.sendCalls = [];
-    /** @type {Array<any[]>} */
-    this.submitCalls = [];
     this.sendOutcomes = sendOutcomes;
-    this.submitOutcomes = submitOutcomes;
-  }
-
-  /**
-   * @param {Array<{throw?: Error, ok?: boolean}>} outcomes
-   * @param {any[]} call
-   */
-  static async outcome(outcomes, call) {
-    const next = outcomes.shift() ?? { ok: true };
-    if (next.throw) throw next.throw;
-    return call;
   }
 
   /** @param {...any} args */
   async send(...args) {
     this.sendCalls.push(args);
-    return FakeRouter.outcome(this.sendOutcomes, args);
-  }
-
-  /** @param {...any} args */
-  async submitToPropagationNode(...args) {
-    this.submitCalls.push(args);
-    return FakeRouter.outcome(this.submitOutcomes, args);
+    const next = this.sendOutcomes.shift() ?? { ok: true };
+    if (next.throw) throw next.throw;
   }
 }
 
-const UNKNOWN_DEST = () =>
-  new Error(
-    `Cannot deliver: identity for ac880aeabfa2f2e70dc57a44aaf9f370 is unknown`,
-  );
-const NO_PROOF = () =>
-  new Error(
-    "Opportunistic delivery to ac880aeabfa2f2e70dc57a44aaf9f370 failed: no delivery proof was received from the recipient",
-  );
-
 /**
  * @param {FakeRouter} lxmf
- * @param {string|null} propagationNodeHex
+ * @param {string|null} [propagationNodeHex]
  * @returns {(message: any, link?: any) => Promise<void>}
  */
 function sender(lxmf, propagationNodeHex = null) {
@@ -181,76 +84,78 @@ function sender(lxmf, propagationNodeHex = null) {
   }).sendWithRetry;
 }
 
-test("sendWithRetry recovers when the announce lands mid-wait (restart race)", async () => {
-  const lxmf = new FakeRouter({ sendOutcomes: [{ throw: UNKNOWN_DEST() }] });
-  const transport = lxmf.rns.transport;
-  const message = { destinationHash: DEST };
-  const done = sender(lxmf)(message);
-  // The solicited owner answers with its announce during the wait.
-  setTimeout(() => transport.announce(DEST), 5);
-  await done;
-  assert.equal(lxmf.sendCalls.length, 2); // failed attempt + retry
-  assert.equal(lxmf.submitCalls.length, 0); // never reached propagation
-  assert.deepEqual(transport.pathRequests, [
-    "ac880aeabfa2f2e70dc57a44aaf9f370",
-  ]);
+test("isUnknownIdentityError matches only the router's typed unknown-identity failure", () => {
+  assert.ok(isUnknownIdentityError(new UnknownIdentityError(DEST)));
+  assert.ok(!isUnknownIdentityError(new Error("some other failure")));
+  assert.ok(!isUnknownIdentityError("UnknownIdentityError"));
 });
 
-test("sendWithRetry escalates to the propagation node when direct fails", async () => {
-  const lxmf = new FakeRouter({
-    sendOutcomes: [
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-    ],
+test("sendWithRetry escalates to propagation only when a node is configured", async () => {
+  const withoutNode = new FakeRouter();
+  await sender(withoutNode)({ destinationHash: DEST });
+  assert.deepEqual(withoutNode.sendCalls[0][2], {
+    fallback: "opportunistic",
+    timeoutMs: 500,
   });
-  const message = { destinationHash: DEST };
-  await sender(lxmf, "f033f136cdae7691c9cfc35082540832")(message);
-  assert.equal(lxmf.sendCalls.length, 3); // initial + link retry + no-link
-  assert.equal(lxmf.submitCalls.length, 1);
-  assert.equal(lxmf.submitCalls[0][0], message); // same LXMessage object
-});
 
-test("sendWithRetry without a propagation node keeps the failure", async () => {
-  const lxmf = new FakeRouter({
-    sendOutcomes: [
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-    ],
+  const withNode = new FakeRouter();
+  await sender(withNode, NODE_HEX)({ destinationHash: DEST });
+  assert.deepEqual(withNode.sendCalls[0][2], {
+    fallback: "propagation",
+    timeoutMs: 500,
   });
-  await assert.rejects(sender(lxmf)({ destinationHash: DEST }), NO_PROOF());
-  assert.equal(lxmf.submitCalls.length, 0);
 });
 
-test("sendWithRetry waits for the propagation node's announce, then submits", async () => {
+test("sendWithRetry passes the arrival link as linkId", async () => {
+  const lxmf = new FakeRouter();
+  const link = new Uint8Array(16);
+  await sender(lxmf, NODE_HEX)({ destinationHash: DEST }, link);
+  assert.deepEqual(lxmf.sendCalls[0][2], {
+    fallback: "propagation",
+    timeoutMs: 500,
+    linkId: link,
+  });
+});
+
+test("sendWithRetry keeps the router's failure without a propagation node", async () => {
+  const failure = new UnknownIdentityError(DEST);
+  const lxmf = new FakeRouter({ sendOutcomes: [{ throw: failure }] });
+  await assert.rejects(sender(lxmf)({ destinationHash: DEST }), failure);
+  assert.equal(lxmf.rns.transport.solicitCalls.length, 0);
+});
+
+test("sendWithRetry solicits the propagation node and resends on its announce", async () => {
+  // The router escalated through direct and opportunistic delivery, handed
+  // off to the propagation node — whose announce had not landed yet, so the
+  // submit declined. The recovery solicits the node and resends.
   const lxmf = new FakeRouter({
     sendOutcomes: [
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-    ],
-    submitOutcomes: [
       {
         throw: new Error(
-          "Propagation node identity unknown for f033f136cdae7691c9cfc35082540832; wait for its announce.",
+          `Propagation node identity unknown for ${NODE_HEX}; wait for its announce.`,
         ),
       },
     ],
   });
-  const transport = lxmf.rns.transport;
-  const done = sender(
-    lxmf,
-    "f033f136cdae7691c9cfc35082540832",
-  )({
-    destinationHash: DEST,
-  });
-  setTimeout(() => transport.announce(OTHER), 5); // node announces mid-wait
-  await done;
-  assert.equal(lxmf.submitCalls.length, 2); // failed submit + retry after announce
-  assert.deepEqual(transport.pathRequests, [
-    "f033f136cdae7691c9cfc35082540832",
-  ]);
+  await sender(lxmf, NODE_HEX)({ destinationHash: DEST });
+  assert.equal(lxmf.sendCalls.length, 2); // failed attempt + resend
+  assert.deepEqual(lxmf.rns.transport.solicitCalls, [[NODE, 500]]);
+});
+
+test("sendWithRetry gives up when the propagation node never announces", async () => {
+  const submitDecline = new Error(
+    `Propagation node identity unknown for ${NODE_HEX}; wait for its announce.`,
+  );
+  const lxmf = new FakeRouter({ sendOutcomes: [{ throw: submitDecline }] });
+  lxmf.rns.transport.onSolicit = async () => {
+    throw new UnknownIdentityError(NODE);
+  };
+  // The original failure stands — the node's silence is logged, not thrown.
+  await assert.rejects(
+    sender(lxmf, NODE_HEX)({ destinationHash: DEST }),
+    submitDecline,
+  );
+  assert.equal(lxmf.sendCalls.length, 1); // no resend
 });
 
 test("contentFields signals Markdown rendering (FIELD_RENDERER)", () => {
@@ -263,20 +168,4 @@ test("contentFields signals Markdown rendering (FIELD_RENDERER)", () => {
   // Wire values per upstream LXMF: field 0x0F, renderer 0x02.
   assert.equal(LXMFConstants.FIELD_RENDERER, 0x0f);
   assert.equal(LXMFConstants.RENDERER_MARKDOWN, 0x02);
-});
-
-test("sendWithRetry reports the failure when everything fails", async () => {
-  const submitError = new Error("stamp cost too high");
-  const lxmf = new FakeRouter({
-    sendOutcomes: [
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-      { throw: NO_PROOF() },
-    ],
-    submitOutcomes: [{ throw: submitError }],
-  });
-  await assert.rejects(
-    sender(lxmf, "f033f136cdae7691c9cfc35082540832")({ destinationHash: DEST }),
-    submitError,
-  );
 });

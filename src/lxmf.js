@@ -11,7 +11,13 @@
  */
 
 import { join } from "node:path";
-import { fromHex, Identity, Reticulum, toHex } from "@reticulum/core";
+import {
+  fromHex,
+  Identity,
+  Reticulum,
+  toHex,
+  UnknownIdentityError,
+} from "@reticulum/core";
 import { LXMessage, LXMFConstants, LXMRouter } from "@reticulum/lxmf";
 import {
   AutoInterface,
@@ -23,34 +29,27 @@ import { createBz2 } from "./bz2.js";
 import { chunkText } from "./text.js";
 
 /**
- * The LXMRouter's failure when the destination's identity has not been
- * learned yet (no announce heard): `send` declines instantly — no link can
- * be established and opportunistic encryption is impossible without the
- * recipient's public key.
- */
-const UNKNOWN_IDENTITY_MESSAGE =
-  /^Cannot deliver: identity for [0-9a-f]+ is unknown$/;
-
-/**
- * How long {@link waitForPeerIdentity} waits for a solicited announce
- * before giving up (and `sendWithRetry` falling back to its plain retries).
- * Generous on purpose: the peer may be several slow mesh hops away, and the
- * common trigger (the startup notification racing the owner's first
- * announce after a daemon restart) is worth waiting for — the alternative
- * parks the message in the bridge's `failedNote` until the *next* reply.
+ * How long the router may solicit a peer for its announce (path request →
+ * awaited announce via `transport.recallOrSolicitIdentity`) before giving
+ * up on a send. Generous on purpose: the peer may be several slow mesh
+ * hops away, and the common trigger (the startup notification racing the
+ * owner's first announce after a daemon restart) is worth waiting for —
+ * the alternative parks the message in the bridge's `failedNote` until
+ * the *next* reply.
  */
 const PEER_DISCOVERY_WAIT_MS = 30_000;
 
 /**
- * Whether `e` is the router's unknown-destination failure — the caller
- * should solicit the peer (path request + announce) instead of retrying
- * blind, since the retry cannot succeed until the announce lands.
+ * Whether `e` is the typed unknown-identity failure the router throws when
+ * a destination's identity is neither recallable nor solicitable within the
+ * send's time budget — no link can be established and opportunistic
+ * encryption is impossible without the recipient's public key.
  *
  * @param {unknown} e
- * @returns {e is Error}
+ * @returns {e is UnknownIdentityError}
  */
 export function isUnknownIdentityError(e) {
-  return e instanceof Error && UNKNOWN_IDENTITY_MESSAGE.test(e.message);
+  return e instanceof UnknownIdentityError;
 }
 
 /**
@@ -68,91 +67,30 @@ export function contentFields() {
 }
 
 /**
- * Waits until `transport` can recall the identity for `destinationHash`,
- * soliciting it first: a path request makes the destination itself (or any
- * transport node holding its path) announce, and the ingested announce
- * populates the destination→identity mapping. Resolves early once an
- * announce for the exact destination arrives, `false` on timeout.
+ * Builds the outbound delivery call behind `sendText`/`sendReaction`. Since
+ * reticulum-js 0.9.3 the router escalates on its own
+ * (`send(message, identity, { linkId, fallback, solicit, timeoutMs })`):
+ * DIRECT link → opportunistic packet (soliciting the recipient's identity
+ * via `transport.recallOrSolicitIdentity` when no announce has been heard —
+ * the restart race, since reticulum-js keeps the destination→identity map
+ * in memory) → propagation store-and-forward when an outbound node is set.
+ * All of that happens inside one `send` call against one serialized message,
+ * so every wire copy shares one message id and a deduplicating client
+ * renders the reply once.
  *
- * Closes the restart gap the router leaves open: `_establishDirectLink`
- * only requests-and-awaits a path once the identity is *known*, so an
- * unknown identity fails the whole `send` without any mesh solicitation.
- * reticulum-js keeps `knownDestinations` in memory, so every daemon restart
- * re-enters that state until the owner's next announce.
- *
- * @param {any} transport - `rns.transport` (EventTarget with
- *   `recallIdentity`, `requestPath`; tolerates missing methods for test
- *   doubles).
- * @param {Uint8Array} destinationHash
- * @param {number} timeoutMs
- * @returns {Promise<boolean>} `true` when the identity is recallable on return.
- */
-export async function waitForPeerIdentity(
-  transport,
-  destinationHash,
-  timeoutMs,
-) {
-  const destHex = toHex(destinationHash);
-  const recall = () =>
-    Promise.resolve()
-      .then(() => transport?.recallIdentity(destinationHash))
-      .catch(() => null);
-  if (await recall()) return true;
-  try {
-    await transport?.requestPath?.(destinationHash);
-  } catch {
-    /* best effort — a late announce still has the timeout window */
-  }
-  if (await recall()) return true;
-  return new Promise((resolve) => {
-    let settled = false;
-    /** @type {NodeJS.Timeout|null} */
-    let timer = null;
-    const finish = (/** @type {boolean} */ ok) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      transport.removeEventListener("announce", onAnnounce);
-      resolve(ok);
-    };
-    // The transport dispatches "announce" only after `rememberIdentity`
-    // completed, so a matching event implies a recallable identity; the
-    // re-check is belt-and-braces against half-fakes in tests.
-    const onAnnounce = (/** @type {any} */ ev) => {
-      const announced = ev?.detail?.destinationHash;
-      if (!announced || toHex(announced) !== destHex) return;
-      void recall().then((identity) => finish(Boolean(identity)));
-    };
-    timer = setTimeout(() => finish(false), timeoutMs);
-    transport.addEventListener("announce", onAnnounce);
-  });
-}
-
-/**
- * Builds the outbound retry chain behind `sendText`/`sendReaction`:
- *
- * 1. `lxmf.send` over the given link (DIRECT; the router falls back to an
- *    opportunistic packet internally when no link can be established),
- * 2. on the router's unknown-identity failure: solicit the destination
- *    (path request → announce) and wait for its announce — the restart
- *    race, since reticulum-js keeps the destination→identity map in
- *    memory and an immediate retry cannot succeed,
- * 3. retry over the same link, then once more without it (the arrival
- *    link is usually gone by reply time on battery-conscious clients),
- * 4. store-and-forward via the configured propagation node — the owner is
- *    likely off-mesh entirely; their next sync picks the message up.
- *
- * The same `LXMessage` object flows through every attempt so all wire
- * copies share one message id and a deduplicating client renders the
- * reply once. Factored out of `startLxmf` with injected dependencies so
- * the chain is testable against a fake router.
+ * The one gap left: the router's propagation handoff
+ * (`submitToPropagationNode`) still declines when the *node's* announce has
+ * not been heard yet (fresh start), while a recipient identity is solicited
+ * internally. `sendWithRetry` catches that failure, solicits the node and
+ * resends. Factored out of `startLxmf` with injected dependencies so the
+ * behavior is testable against a fake router.
  *
  * @param {object} deps
  * @param {LXMRouter} deps.lxmf - Initialised router.
  * @param {Identity} deps.identity - The node's LXMF identity (signs sends).
  * @param {string|null} [deps.propagationNodeHex] - Configured propagation
  *   node's `lxmf.propagation` hash; enables the store-and-forward fallback
- *   (reticulum-js's `send` never consults the outbound node on its own).
+ *   (`fallback: "propagation"` on the router's send).
  * @param {(msg: string) => void} [deps.log] - Diagnostic sink.
  * @param {number} [deps.peerWaitMs] - Per-peer announce wait (overridable in tests).
  * @returns {{sendWithRetry: (message: LXMessage, link?: any) => Promise<void>}}
@@ -169,105 +107,56 @@ export function createRetrySender({
     : null;
 
   /**
-   * Last-resort store-and-forward through the configured propagation
-   * node, reached from `sendWithRetry` after direct and opportunistic
-   * delivery both failed — typically the owner being off-mesh entirely
-   * (the mobile case). The propagated form is encrypted to the *recipient's*
-   * public key (`dest_hash ‖ E(src‖sig‖payload)`), so it needs their
-   * identity (by then known — the earlier sends failed on reachability,
-   * not identity) but **no live path**: the node holds the message until
-   * the owner's next sync. A node whose announce hasn't been heard yet
-   * (fresh start) is solicited and waited for like unknown recipients are.
-   *
-   * @param {LXMessage} message
-   * @param {Uint8Array} nodeHash - The configured node's `lxmf.propagation`
-   *   hash (callers guarantee it is set).
-   */
-  async function submitViaPropagationNode(message, nodeHash) {
-    const describe = (/** @type {unknown} */ e) =>
-      e instanceof Error ? e.message : String(e);
-    const nodeHex = toHex(nodeHash);
-    try {
-      try {
-        await lxmf.submitToPropagationNode(message, identity);
-      } catch (e) {
-        if (!/Propagation node identity unknown/.test(describe(e))) throw e;
-        log(
-          `pi-lxmf: propagation node ${nodeHex} unknown — requesting path, ` +
-            `waiting up to ${Math.round(peerWaitMs / 1000)}s for its announce`,
-        );
-        const learned = await waitForPeerIdentity(
-          lxmf.rns.transport,
-          nodeHash,
-          peerWaitMs,
-        );
-        if (!learned) throw e;
-        await lxmf.submitToPropagationNode(message, identity);
-      }
-      log(
-        "pi-lxmf: owner unreachable directly — submitted via propagation " +
-          "node (delivered on their next sync)",
-      );
-    } catch (e) {
-      log(`pi-lxmf: propagation submit failed (${describe(e)})`);
-      throw e;
-    }
-  }
-
-  /**
    * @param {LXMessage} message
    * @param {any} [link]
    */
   async function sendWithRetry(message, link) {
+    const options =
+      /** @type {{linkId?: Uint8Array, fallback?: "propagation"|"opportunistic", timeoutMs?: number}} */ ({
+        fallback: propagationNodeHash ? "propagation" : "opportunistic",
+        timeoutMs: peerWaitMs,
+        ...(link ? { linkId: link } : {}),
+      });
     try {
-      await lxmf.send(message, identity, link);
+      await lxmf.send(message, identity, options);
     } catch (e) {
-      log(
-        `pi-lxmf: LXMF send failed (${e instanceof Error ? e.message : e}), retrying once`,
-      );
-      // The destination's identity is unknown (typically: the startup
-      // notification racing the owner's first announce after a restart —
-      // `knownDestinations` is in-memory in reticulum-js, so every restart
-      // forgets it). An immediate retry cannot succeed; solicit the peer
-      // and give its announce time to land first.
-      if (isUnknownIdentityError(e)) {
-        const destHex = toHex(message.destinationHash);
+      // Direct and opportunistic both failed and the router fell through
+      // to its propagation handoff — but the node's announce has not
+      // landed yet (fresh start), so the submit declined instead of
+      // queueing. Solicit the node and resend; the message keeps its
+      // messageId across serialize() calls, so wire-level dedup still
+      // holds.
+      if (
+        propagationNodeHash &&
+        e instanceof Error &&
+        /Propagation node identity unknown/.test(e.message)
+      ) {
         log(
-          `pi-lxmf: identity for ${destHex} unknown — requesting path, waiting up to ${Math.round(peerWaitMs / 1000)}s for its announce`,
-        );
-        const learned = await waitForPeerIdentity(
-          lxmf.rns.transport,
-          message.destinationHash,
-          peerWaitMs,
-        );
-        log(
-          learned
-            ? `pi-lxmf: learned ${destHex} — retrying delivery`
-            : `pi-lxmf: no announce from ${destHex} in ${Math.round(peerWaitMs / 1000)}s — retrying anyway`,
-        );
-      }
-      try {
-        await lxmf.send(message, identity, link);
-      } catch (e2) {
-        // The arrival link is likely gone (the peer closed it after its
-        // message was acknowledged). Retry without it: `LXMRouter.send`
-        // then establishes a fresh DIRECT link, falling back to an
-        // opportunistic packet. Same message object → same message id, so
-        // a deduplicating client renders the reply once.
-        log(
-          `pi-lxmf: link retry failed (${e2 instanceof Error ? e2.message : e2}), retrying without link`,
+          `pi-lxmf: propagation node ${propagationNodeHex} unknown — requesting path, ` +
+            `waiting up to ${Math.round(peerWaitMs / 1000)}s for its announce`,
         );
         try {
-          await lxmf.send(message, identity, null);
-        } catch (e3) {
-          // Direct and opportunistic both failed: the owner is likely
-          // off-mesh. Store-and-forward via the configured propagation
-          // node instead of losing the reply (their next sync picks it
-          // up); without a configured node the failure stands.
-          if (!propagationNodeHash) throw e3;
-          await submitViaPropagationNode(message, propagationNodeHash);
+          await lxmf.rns.transport.recallOrSolicitIdentity(
+            propagationNodeHash,
+            peerWaitMs,
+          );
+        } catch (solicitError) {
+          if (solicitError instanceof UnknownIdentityError) {
+            log(
+              `pi-lxmf: no announce from propagation node ${propagationNodeHex} in ${Math.round(peerWaitMs / 1000)}s — giving up`,
+            );
+            throw e;
+          }
+          throw solicitError;
         }
+        await lxmf.send(message, identity, options);
+        log(
+          "pi-lxmf: owner unreachable directly — submitted via propagation " +
+            "node (delivered on their next sync)",
+        );
+        return;
       }
+      throw e;
     }
   }
 
@@ -400,6 +289,9 @@ export async function startLxmf(config, options = {}) {
     storageAdapter: new FileStorageAdapter(storageDir),
     compressionProvider: bz2,
   });
+  // Persistor hydration and background services (interface discovery) must
+  // be settled before the identity is loaded and announces go out.
+  await rns.ready();
 
   /** @type {string[]} */
   const interfaceNames = [];
@@ -467,13 +359,13 @@ export async function startLxmf(config, options = {}) {
   });
   log(`pi-lxmf: announcing as "${config.name}"`);
 
-  // Optional propagation-node integration: outbound submits go through the
-  // node when neither a direct link nor opportunistic delivery can be
-  // established, and a periodic sync pulls messages that arrived while
-  // this daemon was down. (reticulum-js's `send` never consults the
-  // outbound node on its own — `submitToPropagationNode` is an explicit
-  // call — so the store-and-forward fallback in `sendWithRetry` below is
-  // what makes the config effective.)
+  // Optional propagation-node integration: a periodic sync pulls messages
+  // that arrived while this daemon was down, and (since reticulum-js 0.9.3)
+  // the router's own send escalation submits outbound messages to the node
+  // as the last fallback when neither a direct link nor opportunistic
+  // delivery can be established — the `fallback: "propagation"` option set
+  // by `createRetrySender` below is what makes the config effective on the
+  // outbound side.
   const propagationNodeHash = config.propagationNode
     ? fromHex(config.propagationNode)
     : null;
@@ -513,15 +405,12 @@ export async function startLxmf(config, options = {}) {
 
   /**
    * Sends `text` to `destinationHex` (a 32-hex lxmf.delivery source hash),
-   * chunked to `chunkChars`, titled on the first chunk. A failed send is
-   * retried once over the same path, then once more opportunistically
-   * (without the link), and finally submitted to the configured
-   * propagation node for store-and-forward — see {@link createRetrySender}
-   * for the full escalation order. Battery-conscious mobile clients tear
-   * their link down right after their message is acknowledged, so the
-   * arrival link can be gone by reply time; the same `LXMessage` object is
-   * re-sent so all wire copies share one message id and a deduplicating
-   * client shows the reply once (learned in signalk-reticulum's deliverer).
+   * chunked to `chunkChars`, titled on the first chunk. Delivery escalates
+   * inside the router's `send`: DIRECT link → opportunistic packet (with
+   * recipient-identity solicitation) → propagation store-and-forward — see
+   * {@link createRetrySender} for how the options are set. All copies on
+   * the wire share one message id, so a deduplicating client shows the
+   * reply once.
    *
    * @param {string} destinationHex
    * @param {string} text
@@ -553,8 +442,7 @@ export async function startLxmf(config, options = {}) {
    * reaction field is rendered natively by Sideband/NomadNet (confirmed in
    * live testing); no `content` is set so no separate chat bubble is
    * produced alongside the reaction. Reuses `sendWithRetry` for the same
-   * retry-once path as `sendText` (same message object across retries → one
-   * message id).
+   * router-escalated delivery as `sendText` (one message id on the wire).
    *
    * @param {string} destinationHex
    * @param {Uint8Array} targetMessageId - The `message_id` of the message being reacted to.
