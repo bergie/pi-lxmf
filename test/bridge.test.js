@@ -1345,3 +1345,70 @@ test("mid-run failure after partial output is reported, not swallowed", async ()
     /503 overloaded/,
   );
 });
+
+test("program status: auth block delivered once, deduped until state moves on", async () => {
+  const { rpc, mesh } = makeBridge({ owner: OWNER });
+
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "auth", msg: "Login required" },
+    }),
+  );
+  await sleep(10);
+  assert.equal(mesh.sent.length, 1);
+  assert.match(mesh.sent[0].text, /🔐/);
+  assert.match(mesh.sent[0].text, /Login required/);
+
+  // Same block again: no duplicate.
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "auth", msg: "Login required" },
+    }),
+  );
+  await sleep(10);
+  assert.equal(mesh.sent.length, 1);
+
+  // A different message delivers again.
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "auth", msg: "Token expired" },
+    }),
+  );
+  await sleep(10);
+  assert.equal(mesh.sent.length, 2);
+
+  // State moves on (idle/working/done): dedup resets.
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", { detail: { state: "idle" } }),
+  );
+  await sleep(10);
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "auth", msg: "Login required" },
+    }),
+  );
+  await sleep(10);
+  assert.equal(mesh.sent.length, 3);
+});
+
+test("program status: dialog blocks are not relayed (auto-dismiss handles them)", async () => {
+  const { rpc, mesh } = makeBridge({ owner: OWNER });
+
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "permission", msg: "Approve?" },
+    }),
+  );
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "blocked", kind: "question", msg: "Pick one" },
+    }),
+  );
+  rpc.dispatchEvent(
+    new CustomEvent("program-status", {
+      detail: { state: "done", msg: "Upgraded 12 packages" },
+    }),
+  );
+  await sleep(10);
+  assert.equal(mesh.sent.length, 0);
+});

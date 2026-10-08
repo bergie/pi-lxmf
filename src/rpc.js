@@ -8,6 +8,12 @@
  * - Responses (`type: "response"`) are correlated by `id`.
  * - All other output records are agent/runtime events, forwarded to the
  *   bridge via the `"event"` EventTarget event.
+ * - Program Status Protocol reports (`OSC 7501`, sent because the child
+ *   runs with `PI_PROGRAM_STATUS=1` — there is no terminal here to answer
+ *   the protocol's support query) are extracted from the child's stdout
+ *   and stderr streams and forwarded via the `"program-status"` event.
+ *   Stripping them before the JSONL reader keeps the strict JSONL framing
+ *   intact even when a sequence shares a chunk (or a line) with records.
  *
  * Framing follows the protocol's strict JSONL semantics: records are
  * delimited by LF (`\n`) only, a trailing `\r` is tolerated, and Node's
@@ -22,6 +28,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
+
+import { createStatusFilter } from "./status.js";
 
 /** Thrown when a Pi RPC command fails (`success: false`) or times out. */
 export class RpcError extends Error {
@@ -110,6 +118,7 @@ export function assistantText(message) {
  *
  * Emits EventTarget events:
  * - `"event"`    — `{ detail: event }` for every non-response Pi event.
+ * - `"program-status"` — `{ detail: report }` per valid OSC 7501 report pi writes to stdout/stderr (see `src/status.js`).
  * - `"ready"`    — the child is accepting commands (initially and after restarts).
  * - `"restarting"` — `{ detail: { code, signal, attempt } }` unexpected exit; respawn scheduled.
  * - `"switching"` — `{ detail: { cwd } }` a `setCwd()` respawn starts; the old child is about to be killed.
@@ -220,7 +229,14 @@ export class PiRpcClient extends EventTarget {
   spawnChild() {
     const child = this.spawnFn(this.piBin, this.argv(), {
       cwd: this.cwd,
-      env: process.env,
+      // The Program Status Protocol's support query is answered by a
+      // terminal; a headless RPC child has none, so without this pi would
+      // never report. Force reports on unless the operator chose a value
+      // ("0" turns them off, "1" sends without asking).
+      env: {
+        ...process.env,
+        PI_PROGRAM_STATUS: process.env.PI_PROGRAM_STATUS ?? "1",
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
@@ -228,21 +244,63 @@ export class PiRpcClient extends EventTarget {
     this.ready = false;
 
     const stdout = createJsonlReader((line) => this.routeLine(line, "stdout"));
+    const stdoutStatus = createStatusFilter(
+      (report) =>
+        this.dispatchEvent(
+          new CustomEvent("program-status", { detail: report }),
+        ),
+      {
+        onQuery: () =>
+          this.log(
+            "pi-lxmf: pi probed for OSC 7501 support — not answered (reports are forced on via PI_PROGRAM_STATUS)",
+          ),
+        onInvalid: (reason) =>
+          this.log(`pi-lxmf: discarded program status report (${reason})`),
+      },
+    );
     child.stdout?.on("data", (/** @type {Buffer} */ chunk) => {
+      /** @type {string} */
+      let clean;
       try {
-        stdout.push(chunk);
+        clean = stdoutStatus.push(chunk);
+      } catch (e) {
+        this.log(`pi-lxmf: program status extraction error: ${e}`);
+        return;
+      }
+      try {
+        stdout.push(clean);
       } catch (e) {
         this.log(`pi-lxmf: rpc stdout framing error: ${e}`);
       }
     });
-    child.stdout?.on("end", () => stdout.flush());
+    child.stdout?.on("end", () => {
+      stdout.push(stdoutStatus.flush());
+      stdout.flush();
+    });
 
     const stderr = createJsonlReader((line) =>
       this.log(`pi stderr: ${line.slice(0, 400)}`),
     );
+    const stderrStatus = createStatusFilter(
+      (report) =>
+        this.dispatchEvent(
+          new CustomEvent("program-status", { detail: report }),
+        ),
+      {
+        onInvalid: (reason) =>
+          this.log(`pi-lxmf: discarded program status report (${reason})`),
+      },
+    );
     child.stderr?.on("data", (/** @type {Buffer} */ chunk) => {
+      /** @type {string} */
+      let clean;
       try {
-        stderr.push(chunk);
+        clean = stderrStatus.push(chunk);
+      } catch {
+        clean = ""; // extraction failure: nothing to feed the log reader
+      }
+      try {
+        stderr.push(clean);
       } catch {
         /* oversized stderr line: dropped */
       }

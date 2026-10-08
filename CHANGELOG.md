@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Program Status Protocol (OSC 7501) relay** (auth blocks): the supervised `pi --mode rpc` child now runs with `PI_PROGRAM_STATUS=1` (an operator-set `PI_PROGRAM_STATUS` value is respected, including `0` to turn reports off), so pi reports its state with the Program Status Protocol even though no terminal is there to answer the protocol's support query. `src/status.js` extracts the escape sequences from the child's stdout and stderr (handling sequences split across chunks and the `ST`/`BEL` terminators, and validating each report against the protocol grammar and limits) before the strict JSONL RPC reader sees the stream, so a report glued to an RPC record cannot corrupt framing. Valid reports surface as a `program-status` event on `PiRpcClient`. The bridge relays `blocked` reports with `kind=auth` — a login wait, which would otherwise look like silence over LXMF — as a `🔐 pi needs a login: …` message, deduplicated until the state moves on; dialog-driven blocks (`permission`/`question`) are already covered by the extension-dialog auto-dismiss path and are not duplicated.
+
 ## [0.3.0] - 2026-10-03
 
 ### Changed

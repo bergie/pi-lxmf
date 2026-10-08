@@ -195,6 +195,24 @@ try {
   }
   check("reply titled with the session name", echo?.title === "smoke");
 
+  // --- 1b. Program Status Protocol report → owner notification ------------
+  // fake-pi emitted an OSC 7501 auth block glued to the prompt response;
+  // the bridge relays it as its own LXMF message.
+  const statusUntil = Date.now() + 15000;
+  while (
+    Date.now() < statusUntil &&
+    !received.some(
+      (m) => /🔐/.test(m.content) && /Login required/.test(m.content),
+    )
+  ) {
+    await sleep(200);
+  }
+  const statusNotice = received.filter((m) => /🔐/.test(m.content));
+  check(
+    "program status auth block relayed to the owner",
+    statusNotice.length === 1,
+  );
+
   // --- 2. /help (no LLM turn) ----------------------------------------------
   await sendToDaemon("/help");
   const helpUntil = Date.now() + 15000;

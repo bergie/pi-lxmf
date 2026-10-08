@@ -28,6 +28,10 @@ import { errorText } from "./text.js";
 /** Extension-UI methods that expect a response (dialogs to decline). */
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
+/**
+ * @typedef {import("./status.js").ProgramStatus} ProgramStatus
+ */
+
 /** Emoji sent as a run-start acknowledgement when no reply lands fast. */
 const REACTION_EMOJI = "🤔";
 /** How long after `agent_start` to wait for a reply before acknowledging. */
@@ -129,6 +133,9 @@ export class Bridge {
     this.recovering = false;
     /** @type {string|null} */
     this.lastError = null;
+    /** Signature of the last program-status block we delivered (dedup). */
+    /** @type {string|null} */
+    this.lastBlockedSignature = null;
     /** @type {string|null} */
     this.failedNote = null;
     /** The most recently observed active model (gates the GLM quota watcher). */
@@ -155,6 +162,9 @@ export class Bridge {
 
     this.rpc.addEventListener("event", (/** @type {any} */ event) => {
       this.handlePiEvent(event.detail);
+    });
+    this.rpc.addEventListener("program-status", (/** @type {any} */ event) => {
+      this.handleProgramStatus(event.detail);
     });
     this.rpc.addEventListener("ready", () => {
       this.setRpcReady(true);
@@ -461,6 +471,35 @@ export class Bridge {
       default:
         break;
     }
+  }
+
+  /**
+   * Handles a Program Status Protocol (OSC 7501) report from Pi.
+   *
+   * Most states are already covered by the exchange model (replies land as
+   * messages, run failures surface via `agent_settled`, extension dialogs
+   * are auto-dismissed with their own notice), so the bridge only reacts
+   * to what has no other channel: a login wait (`blocked` with
+   * `kind=auth`), which would otherwise look like silence over LXMF.
+   * Repeats of the same block are deduplicated until the state moves on.
+   *
+   * @param {ProgramStatus|null} report
+   */
+  handleProgramStatus(report) {
+    if (!report || typeof report !== "object") return;
+    if (report.state !== "blocked") {
+      this.lastBlockedSignature = null;
+      return;
+    }
+    if (report.kind !== "auth") return; // dialogs: extension_ui_request path
+    const text = report.msg || report.title || "authentication required";
+    const signature = report.msg || report.title || "";
+    if (signature === this.lastBlockedSignature) return;
+    this.lastBlockedSignature = signature;
+    this.log.log("pi-lxmf: pi is blocked on authentication (program status)");
+    void this.deliver(
+      `🔐 pi needs a login: ${text} (nobody is at the terminal).`,
+    );
   }
 
   /**

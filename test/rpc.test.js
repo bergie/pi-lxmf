@@ -407,3 +407,99 @@ test("setCwd rejects when the replacement never becomes ready", async () => {
   await assert.rejects(switched, /not ready in \/new/);
   client.stop();
 });
+
+test("program status reports are extracted from stdout and forwarded", async () => {
+  const { client, child } = makeClient();
+  /** @type {any[]} */
+  const reports = [];
+  /** @type {any[]} */
+  const events = [];
+  client.addEventListener("program-status", (/** @type {any} */ e) =>
+    reports.push(e.detail),
+  );
+  client.addEventListener("event", (/** @type {any} */ e) =>
+    events.push(e.detail),
+  );
+
+  const started = client.start();
+  setTimeout(() => child.reply(), 10);
+  await started;
+
+  // pi glues an OSC 7501 report and an RPC event into the same chunk, and
+  // the JSONL framing must survive both.
+  const msg = Buffer.from("Login required", "utf8").toString("base64");
+  child.stdout.write(
+    `\x1b]7501;state=blocked:kind=auth:app=pi:msg=${msg}\x1b\\{"type":"agent_start"}\n`,
+  );
+  child.emitEvent({ type: "agent_settled" });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(reports, [
+    { state: "blocked", kind: "auth", app: "pi", msg: "Login required" },
+  ]);
+  assert.deepEqual(
+    events.map((e) => e.type),
+    ["agent_start", "agent_settled"],
+  );
+
+  client.stop();
+});
+
+test("program status reports are also extracted from stderr", async () => {
+  const { client, child } = makeClient();
+  /** @type {any[]} */
+  const reports = [];
+  client.addEventListener("program-status", (/** @type {any} */ e) =>
+    reports.push(e.detail),
+  );
+  const started = client.start();
+  setTimeout(() => child.reply(), 10);
+  await started;
+
+  child.stderr.write("\x1b]7501;state=working:progress=40\x07");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(reports, [{ state: "working", progress: 40 }]);
+
+  client.stop();
+});
+
+test("child env forces PI_PROGRAM_STATUS on unless the operator set it", async () => {
+  const { client, child } = makeClient();
+  /** @type {any[]} */
+  const envs = [];
+  const original = client.spawnFn;
+  client.spawnFn = (
+    /** @type {string} */ bin,
+    /** @type {string[]} */ args,
+    /** @type {any} */ opts,
+  ) => {
+    envs.push(opts.env);
+    return original(bin, args, opts);
+  };
+  delete process.env.PI_PROGRAM_STATUS;
+  const started = client.start();
+  setTimeout(() => child.reply(), 10);
+  await started;
+  assert.equal(envs[0].PI_PROGRAM_STATUS, "1");
+  client.stop();
+
+  // An explicit operator value is respected.
+  process.env.PI_PROGRAM_STATUS = "0";
+  const second = makeClient();
+  /** @type {any[]} */
+  const envs2 = [];
+  const original2 = second.client.spawnFn;
+  second.client.spawnFn = (
+    /** @type {string} */ bin,
+    /** @type {string[]} */ args,
+    /** @type {any} */ opts,
+  ) => {
+    envs2.push(opts.env);
+    return original2(bin, args, opts);
+  };
+  const started2 = second.client.start();
+  setTimeout(() => second.child.reply(), 10);
+  await started2;
+  assert.equal(envs2[0].PI_PROGRAM_STATUS, "0");
+  second.client.stop();
+  delete process.env.PI_PROGRAM_STATUS;
+});

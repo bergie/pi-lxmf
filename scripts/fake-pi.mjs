@@ -55,6 +55,18 @@ function handle(cmd) {
     case "prompt": {
       send({ type: "response", id: cmd.id, success: true });
       const message = String(cmd.message ?? "");
+      // Once per run: emit a Program Status Protocol report (OSC 7501,
+      // sent because the daemon forces PI_PROGRAM_STATUS=1) glued to the
+      // same stdout chunk as the response — the bridge must extract it
+      // without corrupting the JSONL framing, and relay auth blocks to
+      // the owner over LXMF.
+      if (!globalThis.__statusSent) {
+        globalThis.__statusSent = true;
+        const msg = Buffer.from("Login required", "utf8").toString("base64");
+        process.stdout.write(
+          `\x1b]7501;state=blocked:kind=auth:app=pi:msg=${msg}\x1b\\`,
+        );
+      }
       const text = message.startsWith("LONG ")
         ? "x".repeat(6000)
         : `You said: ${message}`;
