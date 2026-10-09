@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-10
+
 ### Security
 
 - **Persistent replay protection for owner messages** (work doc #8): the router's LXMF message-id dedup is in-memory only, so after a daemon restart a replayed owner message — a propagation node re-serving messages, a duplicate redelivery, or a malicious replay of a captured packet — was signature-valid and would be re-executed, burning tokens on a re-run (or re-triggering a replayed `/quit`). The bridge now records each admitted LXMF message id in a bounded, pruned, persistent set under `dataDir` (`src/seen.js`, file mode `0600`) and drops ids it has seen before, checked after signature verification and *before* processing (at-most-once: a crash mid-run loses the message — recoverable by resending — instead of re-running it after restart).
