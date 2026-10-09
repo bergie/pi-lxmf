@@ -3,6 +3,15 @@
  */
 
 import { strict as assert } from "node:assert";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -94,24 +103,80 @@ test("resolveCwdTarget enforces the under-workdir boundary", () => {
     if (!dirs.has(p)) throw new Error("ENOENT");
     return { isDirectory: () => true };
   };
-  assert.equal(resolveCwdTarget("/w", "a", statDir), "/w/a");
-  assert.equal(resolveCwdTarget("/w", "a/b", statDir), "/w/a/b");
-  assert.equal(resolveCwdTarget("/w", ".", statDir), "/w");
-  assert.equal(resolveCwdTarget("/w", "a/../a", statDir), "/w/a");
-  assert.equal(resolveCwdTarget("/w/", "a", statDir), "/w/a");
+  // Fake realpath matching the fake tree: identity within it (trailing
+  // slashes normalized, like the real realpathSync), ENOENT outside.
+  const realpath = (/** @type {string} */ p) => {
+    const clean = p.replace(/\/+$/, "") || "/";
+    if (!dirs.has(clean)) throw new Error("ENOENT");
+    return clean;
+  };
+  const resolveIn = (
+    /** @type {string} */ workdir,
+    /** @type {string} */ target,
+  ) => resolveCwdTarget(workdir, target, statDir, realpath);
+  assert.equal(resolveIn("/w", "a"), "/w/a");
+  assert.equal(resolveIn("/w", "a/b"), "/w/a/b");
+  assert.equal(resolveIn("/w", "."), "/w");
+  assert.equal(resolveIn("/w", "a/../a"), "/w/a");
+  assert.equal(resolveIn("/w/", "a"), "/w/a");
   // Absolute paths are fine only inside the tree.
-  assert.equal(resolveCwdTarget("/w", "/w/a", statDir), "/w/a");
-  assert.equal(resolveCwdTarget("/w", "/etc", statDir), null);
+  assert.equal(resolveIn("/w", "/w/a"), "/w/a");
+  assert.equal(resolveIn("/w", "/etc"), null);
   // Traversal that escapes the tree is refused.
-  assert.equal(resolveCwdTarget("/w", "..", statDir), null);
-  assert.equal(resolveCwdTarget("/w", "../x", statDir), null);
-  assert.equal(resolveCwdTarget("/w/a", "../..", statDir), null);
+  assert.equal(resolveIn("/w", ".."), null);
+  assert.equal(resolveIn("/w", "../x"), null);
+  assert.equal(resolveIn("/w/a", "../.."), null);
   // Missing paths and non-directories are refused.
-  assert.equal(resolveCwdTarget("/w", "missing", statDir), null);
-  assert.equal(resolveCwdTarget("/w", "", statDir), null);
-  assert.equal(resolveCwdTarget("/w", "   ", statDir), null);
+  assert.equal(resolveIn("/w", "missing"), null);
+  assert.equal(resolveIn("/w", ""), null);
+  assert.equal(resolveIn("/w", "   "), null);
   const statFile = () => ({ isDirectory: () => false });
-  assert.equal(resolveCwdTarget("/w", "a", statFile), null);
+  // statFn is still consulted with the resolved real path.
+  assert.equal(resolveCwdTarget("/w", "a", statFile, realpath), null);
+});
+
+test("resolveCwdTarget resolves symlinks before the containment check", () => {
+  const workdir = mkdtempSync(join(tmpdir(), "pi-lxmf-cwd-"));
+  try {
+    const sub = join(workdir, "sub");
+    mkdirSync(sub);
+    // A repo-planted symlink pointing outside the trust root.
+    const outside = mkdtempSync(join(tmpdir(), "pi-lxmf-out-"));
+    symlinkSync(outside, join(workdir, "escape"));
+
+    // Legit directories still resolve — to their real paths.
+    assert.equal(resolveCwdTarget(workdir, "sub"), realpathSync(sub));
+    assert.equal(resolveCwdTarget(workdir, "."), realpathSync(workdir));
+    // A symlinked escape is refused even though the lexical path sits
+    // inside the workdir.
+    assert.equal(resolveCwdTarget(workdir, "escape"), null);
+    // An absolute path outside the tree is still refused.
+    assert.equal(resolveCwdTarget(workdir, outside), null);
+    // Nonexistent target: refused.
+    assert.equal(resolveCwdTarget(workdir, "missing"), null);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("resolveCwdTarget handles a symlinked workdir component", () => {
+  // A workdir whose own path contains a symlink (e.g. /tmp on macOS) must
+  // not make every legitimate target fail the containment check.
+  const real = mkdtempSync(join(tmpdir(), "pi-lxmf-real-"));
+  const linkDir = `${mkdtempSync(join(tmpdir(), "pi-lxmf-link-"))}/link`;
+  try {
+    symlinkSync(real, linkDir);
+    mkdirSync(join(real, "repo"));
+    assert.equal(
+      resolveCwdTarget(linkDir, "repo"),
+      realpathSync(join(real, "repo")),
+    );
+    // Traversal out of the symlinked root is still refused.
+    assert.equal(resolveCwdTarget(linkDir, ".."), null);
+  } finally {
+    rmSync(real, { recursive: true, force: true });
+    rmSync(dirname(linkDir), { recursive: true, force: true });
+  }
 });
 
 test("formatRepoList shows the current repo and recent repos", () => {

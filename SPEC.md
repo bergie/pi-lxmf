@@ -216,6 +216,12 @@ serialized through a single promise chain so prompts keep their order.
 
 ### 6.2 Inbound pipeline
 
+**Replay dedup.** Between signature verification (§6.1) and any processing,
+the bridge checks the message's `message_id` against a persistent seen-set
+(`dataDir/seen-messages.json`, `src/seen.js`; §8) and drops ids it has
+already admitted. This closes the restart window around the router's
+in-memory message-id dedup: after a daemon restart, a replayed owner message — a propagation node re-serving messages whose purge ack was lost, a duplicate redelivery, or a malicious replay of a captured opportunistic packet — is signature-valid and would otherwise re-execute. That is both a security issue (a replayed `/quit`, or re-running an attacker-chosen old prompt) and a financial one (any accidental replay burns tokens on a full LLM run for output the owner already received). The check is at-most-once by design: the id is recorded before the prompt runs, so a crash mid-run loses the message (recoverable — the owner resends) instead of re-running it after restart. Within one process the router's own message-id dedup covers duplicate copies; the persistent set only guards across restarts. A seen-set I/O failure fails open (logged loudly): a broken state directory must not strand the owner's messages.
+
 For each accepted message:
 
 1. Strip whitespace; ignore empty content.
@@ -301,6 +307,9 @@ such a restriction. When DACAR also brings per-ACL-group LXMF
 identities, `/cd` may evolve from "one child, switch cwd" to a pool of
 children keyed by (identity, repo); the command and its boundary stay
 valid under either model.
+
+Symlinks are resolved before the containment check (`realpathSync` on both
+the `workdir` and the candidate, in `resolveCwdTarget`), so a symlink planted inside a repo pointing outside the tree cannot move the supervised Pi past the trust root, and `/cd` stores and resumes canonical real paths. The daemon canonicalizes `workdir` itself to its real path at startup, so the boundary check, the "already in" comparison and the recent-repos list all see one path form regardless of symlinked parents (e.g. `/tmp` on macOS). A nonexistent target is refused the same way a non-directory is.
 
 The active cwd is persisted (`dataDir/cwd.json`, §8) and revalidated at
 startup (still under `workdir`, still an existing directory — otherwise
@@ -409,7 +418,12 @@ JSON, `0600`, unknown keys rejected with a warning.
   reads it, then removed, so the adoption runs exactly once.
 - `cwd.json` — the active cwd (`{ "cwd": … }`): the repo the owner last
   `/cd`'ed into (§6.6). Revalidated at startup against the `workdir`
-  boundary and the filesystem; unusable values fall back to `workdir`.
+  boundary (symlink-resolved, like every `/cd` target) and the filesystem;
+  unusable values fall back to `workdir`.
+- `seen-messages.json` — the persistent replay-dedup set (§6.2, §11):
+  `{ "version": 1, "seen": { "<message-id hex>": <first-seen epoch ms> } }`.
+  Bounded (1000 ids) and age-pruned (30 days); a missing or corrupt file
+  reads as empty and is rebuilt on the next admission.
 
 **Operational note:** Pi's project trust is not prompted for over LXMF.
 Operators run Pi interactively once in `workdir` (or preconfigure trust) so
@@ -474,6 +488,10 @@ repository exists on the node.
   Pi's RPC commands are used. The agent's own tool use is governed by Pi's
   normal permissions, not relaxed by the bridge. Declined dialogs mean
   approval-gated tools stay gated.
+- **Replay protection.** Signature validity does not expire, so a captured
+  owner ciphertext (opportunistic packets are broadcast to the mesh;
+  propagation nodes store every message submitted through them) can be replayed after a daemon restart, when the router's in-memory message-id dedup is empty. The bridge therefore keeps a persistent seen-set of admitted message ids (§6.2, §8) and drops replays before processing — protecting both against malicious replay (re-executed commands, output redirection) and against the financial cost of accidental redeliveries re-running prompts (token burn). Admission is at-most-once across restarts.
+- **The `/cd` boundary is symlink-resolved.** The multi-repo trust root is enforced on canonical real paths (`resolveCwdTarget`, §6.6), so a symlink planted inside a repo cannot point the supervised Pi outside `workdir`, and the persisted active cwd is revalidated in the same form at startup.
 - **Key hygiene.** The Reticulum identity key is the root of the node's
   identity; `dataDir` must be backed up and treated as secret
   (`FileStorageAdapter` writes `0600`).
@@ -494,11 +512,17 @@ repository exists on the node.
   identity hash really expands to the wire form the router compares).
 - `commands.test.js` — command parsing (`/x`, `!`, bare `!`, case,
   args), model fuzzy matching over a fixture model list, command routing
-  (bridge command vs passthrough prompt).
+  (bridge command vs passthrough prompt), and the `resolveCwdTarget`
+  boundary (traversal, absolute paths, and symlink escapes exercised
+  against the real filesystem).
+- `seen.test.js` — the persistent replay-dedup set: admit-once and replay
+  rejection, persistence across a simulated restart, `0600` file mode,
+  missing/corrupt-file tolerance, and pruning by age and count.
 - `bridge.test.js` — smoketests of the full loop with a fake `PiRpcClient`
   and a fake LXMF sender: prompt→reply delivery, mid-run steering choice,
   empty-tail recovery then nudge, `/new` + session pointer update,
   dialog auto-dismiss, non-owner drop (by derived destination hash),
+  signature-unknown/invalid drops, replayed-message drop (a seen message id is ignored even though it verifies — a replayed `/quit` must not shut the bridge down),
   chunking.
 
 Mesh-level behaviour is exercised end-to-end by `scripts/smoke.mjs` (`npm

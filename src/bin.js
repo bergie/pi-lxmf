@@ -8,7 +8,7 @@
  * signalled or told to quit over LXMF.
  */
 
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { basename } from "node:path";
 import { Bridge } from "./bridge.js";
 import { isUnderWorkdir } from "./commands.js";
@@ -24,6 +24,7 @@ import { deriveLxmfDestinationHash } from "./identity.js";
 import { startLxmf } from "./lxmf.js";
 import { GlmQuotaWatcher, readZaiKey } from "./quota.js";
 import { PiRpcClient } from "./rpc.js";
+import { recordSeenMessage } from "./seen.js";
 
 const USAGE = `pi-lxmf — drive Pi over LXMF messaging
 
@@ -145,6 +146,16 @@ async function main() {
     process.exit(0);
   }
 
+  // Canonicalize the workdir to its real path so every path comparison —
+  // the /cd trust boundary, "already in" checks, recent-repo lists — sees
+  // one form regardless of symlinked parents (e.g. /tmp on macOS). If the
+  // workdir cannot be resolved it does not exist; spawn will fail loudly.
+  try {
+    config.workdir = realpathSync(config.workdir);
+  } catch {
+    /* keep the configured string; resolveCwdTarget refuses targets */
+  }
+
   process.on("unhandledRejection", (e) => {
     console.error("pi-lxmf: unhandled rejection:", e);
   });
@@ -171,13 +182,18 @@ async function main() {
   let startCwd = config.workdir;
   const persistedCwd = readActiveCwd(config.dataDir);
   if (persistedCwd && persistedCwd !== config.workdir) {
-    let usable = isUnderWorkdir(config.workdir, persistedCwd);
-    if (usable) {
-      try {
-        usable = statSync(persistedCwd).isDirectory();
-      } catch {
-        usable = false;
-      }
+    // Revalidate through realpath: the stored cwd was accepted by
+    // `resolveCwdTarget` at /cd time, but the tree may have changed since
+    // (e.g. a symlink planted inside it) — the trust boundary applies to
+    // the real location, not the stored string.
+    let usable = false;
+    try {
+      const realWorkdir = realpathSync(config.workdir);
+      const realCwd = realpathSync(persistedCwd);
+      usable =
+        isUnderWorkdir(realWorkdir, realCwd) && statSync(realCwd).isDirectory();
+    } catch {
+      usable = false;
     }
     if (usable) {
       startCwd = persistedCwd;
@@ -220,6 +236,7 @@ async function main() {
         writeSessionPointer(config.dataDir, workdir, file),
       saveCwd: (cwd) => writeActiveCwd(config.dataDir, cwd),
       listSessions: () => listSessionPointers(config.dataDir),
+      seenMessage: (idHex) => recordSeenMessage(config.dataDir, idHex),
     },
     quotaWatcher: new GlmQuotaWatcher({
       ownerDestinationHash: deriveLxmfDestinationHash(config.owner),

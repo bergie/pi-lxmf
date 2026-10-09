@@ -8,7 +8,7 @@
  * text (or a `{ text, shutdown }` action).
  */
 
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { basename, relative, resolve, sep } from "node:path";
 import { formatDuration, formatTokens } from "./text.js";
 
@@ -36,22 +36,46 @@ export function isUnderWorkdir(workdir, candidate) {
  * paths outside it), does not exist, or is not a directory is refused
  * with `null`.
  *
+ * Symlinks are resolved (both in `workdir` and the candidate) before the
+ * containment check, so a link planted inside a repo pointing outside the
+ * tree cannot smuggle the supervised Pi past the trust boundary; the real
+ * path is returned so Pi runs in the actual directory. Nonexistent paths
+ * are refused (the realpath lookup fails, same as a stat failure would).
+ *
  * @param {string} workdir - The daemon's configured workdir (trust root).
  * @param {string} target - User-supplied path (relative to workdir or absolute).
  * @param {(path: string) => {isDirectory: () => boolean}} [statFn] - Injectable for tests.
- * @returns {string|null} The validated absolute path, or `null` when refused.
+ * @param {(path: string) => string} [realpathFn] - Injectable for tests.
+ * @returns {string|null} The validated absolute real path, or `null` when refused.
  */
-export function resolveCwdTarget(workdir, target, statFn = statSync) {
+export function resolveCwdTarget(
+  workdir,
+  target,
+  statFn = statSync,
+  realpathFn = realpathSync,
+) {
   const trimmed = (target ?? "").trim();
   if (!trimmed) return null;
-  const abs = resolve(workdir, trimmed);
-  if (!isUnderWorkdir(workdir, abs)) return null;
+  let realWorkdir;
   try {
-    if (!statFn(abs).isDirectory()) return null;
+    realWorkdir = realpathFn(workdir);
   } catch {
     return null;
   }
-  return abs;
+  const abs = resolve(workdir, trimmed);
+  let real;
+  try {
+    real = realpathFn(abs);
+  } catch {
+    return null;
+  }
+  if (!isUnderWorkdir(realWorkdir, real)) return null;
+  try {
+    if (!statFn(real).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return real;
 }
 
 /**
@@ -289,7 +313,19 @@ export const bridgeCommands = {
         ctx.log?.(`pi-lxmf: /cd refused: ${args} not under workdir`);
         return `⚠️ /cd refused: "${args}" is not a directory under \`${ctx.workdir}\`.`;
       }
-      if (target === ctx.getBridgeInfo().cwd) {
+      // `target` is the canonical (realpath-resolved) path; compare against
+      // the current cwd in the same form so a symlinked cwd string (e.g. a
+      // legacy persisted value) still matches its real directory.
+      const cwd = ctx.getBridgeInfo().cwd;
+      let current = typeof cwd === "string" ? cwd : null;
+      if (current) {
+        try {
+          current = realpathSync(current);
+        } catch {
+          /* nonexistent cwd can never equal a validated target */
+        }
+      }
+      if (target === current) {
         return `Already in ${target}.`;
       }
       return ctx.changeWorkdir(target);

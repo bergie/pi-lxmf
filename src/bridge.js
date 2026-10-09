@@ -54,6 +54,9 @@ const REACTION_DEBOUNCE_MS = 2000;
  * @property {(workdir: string, file: string) => void} saveSession
  * @property {(cwd: string) => void} [saveCwd] - Persist the active cwd (the `/cd` target).
  * @property {() => Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>} [listSessions] - Per-workdir pointers, recent first.
+ * @property {(idHex: string) => boolean} [seenMessage] - Persistent LXMF message-id dedup
+ *   (replay protection across restarts): `true` when the id is new and now recorded,
+ *   `false` when it was seen before (a replay the caller must drop).
  */
 
 /**
@@ -290,6 +293,34 @@ export class Bridge {
     if (proof !== "verified") {
       this.log.log(`pi-lxmf: inbound from owner: dropped (signature ${proof})`);
       return;
+    }
+
+    // Persistent replay protection (work doc #8): the router's message-id
+    // dedup is in-memory only, so after a restart a replayed owner message
+    // — a propagation node re-serving, a duplicate redelivery, or a
+    // malicious replay of a captured packet — would re-execute: a token
+    // burn for a re-run, or a replayed /quit. Record the id before
+    // processing (at-most-once): a crash mid-run loses the message
+    // (recoverable — the owner resends) instead of re-running it.
+    const messageIdHex = message.messageId
+      ? toHexString(message.messageId)
+      : null;
+    if (messageIdHex && typeof this.state.seenMessage === "function") {
+      /** @type {boolean} */
+      let fresh = true;
+      try {
+        fresh = this.state.seenMessage(messageIdHex);
+      } catch (e) {
+        // Fail open on state I/O errors (a lost dedup file must not strand
+        // the owner's messages); the error is logged loudly.
+        this.log.error(`pi-lxmf: seen-message check failed: ${errorText(e)}`);
+      }
+      if (!fresh) {
+        this.log.log(
+          `pi-lxmf: inbound from owner: ignored (duplicate/replayed message ${messageIdHex})`,
+        );
+        return;
+      }
     }
 
     const content =

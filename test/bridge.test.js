@@ -5,7 +5,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -261,6 +261,9 @@ class FakeState {
     this.savedCwd = null;
     /** @type {Array<{workdir: string|null, sessionFile: string, mtimeMs: number}>} */
     this.sessionList = [];
+    /** Seen LXMF message ids (persistent replay dedup). */
+    /** @type {Set<string>} */
+    this.seenMessages = new Set();
   }
 
   loadOwner() {
@@ -302,6 +305,16 @@ class FakeState {
   listSessions() {
     return this.sessionList;
   }
+
+  /**
+   * @param {string} idHex
+   * @returns {boolean} `true` the first time an id is seen.
+   */
+  seenMessage(idHex) {
+    if (this.seenMessages.has(idHex)) return false;
+    this.seenMessages.add(idHex);
+    return true;
+  }
 }
 
 /**
@@ -316,7 +329,14 @@ function makeBridge(options = {}) {
   const rpc = new FakeRpc();
   const mesh = new FakeMesh();
   const state = new FakeState();
-  const workdir = options.workdir ?? "/workspace";
+  // Canonicalize the workdir like bin.js does at startup, so every path
+  // comparison sees one form regardless of symlinked parents (/tmp on macOS).
+  let workdir = options.workdir ?? "/workspace";
+  try {
+    workdir = realpathSync(workdir);
+  } catch {
+    /* nonexistent workdir (pure-fake tests): keep the configured string */
+  }
   rpc.cwd = workdir;
   /** @type {string[]} */
   const shutdowns = [];
@@ -428,6 +448,43 @@ test("invalid-signature owner message is dropped", async () => {
   await sleep(10);
   assert.equal(rpc.prompts.length, 0);
   assert.equal(mesh.sent.length, 0);
+});
+
+const REPLAY_ID = new Uint8Array(32).fill(0xab);
+const REPLAY_ID_HEX = Array.from(REPLAY_ID, (b) =>
+  b.toString(16).padStart(2, "0"),
+).join("");
+
+test("first delivery of a message id is processed and recorded", async () => {
+  const { bridge, rpc, state, mesh } = makeBridge({ owner: OWNER });
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "run this once",
+    messageId: REPLAY_ID,
+  });
+  await bridge.queue;
+  await sleep(10);
+  assert.equal(rpc.prompts.length, 1);
+  assert.ok(state.seenMessages.has(REPLAY_ID_HEX));
+});
+
+test("replayed owner message (seen id) is ignored even though it verifies", async () => {
+  // After a restart the router's in-memory dedup is empty, so a replayed
+  // (signature-valid) owner message reaches the bridge again. The persisted
+  // seen-id set must drop it: re-running the prompt burns tokens for output
+  // the owner already received (work doc #8).
+  const { bridge, rpc, state, mesh, shutdowns } = makeBridge({ owner: OWNER });
+  state.seenMessages.add(REPLAY_ID_HEX);
+  mesh.emitMessage({
+    sourceHash: OWNER_DEST,
+    content: "/quit",
+    messageId: REPLAY_ID,
+  });
+  await bridge.queue;
+  await sleep(10);
+  assert.equal(rpc.prompts.length, 0);
+  assert.equal(mesh.sent.length, 0);
+  assert.deepEqual(shutdowns, []);
 });
 
 test("empty-tail recovery asks once, then nudges", async () => {
@@ -621,8 +678,10 @@ test("/cd switches the supervised Pi into another repo and resumes its session",
       owner: OWNER,
       workdir: root,
     });
-    // repo-b was visited before: it has a session pointer.
-    state.sessions[repoB] = "/sessions/repo-b.jsonl";
+    // repo-b was visited before: it has a session pointer. The pointer is
+    // keyed by the canonical (realpath) workdir, as /cd stores it.
+    const realRepoB = realpathSync(repoB);
+    state.sessions[realRepoB] = "/sessions/repo-b.jsonl";
     rpc.states.push({
       isStreaming: false,
       sessionName: "repo-b-work",
@@ -632,15 +691,15 @@ test("/cd switches the supervised Pi into another repo and resumes its session",
     mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd repo-b" });
     await bridge.queue;
 
-    assert.deepEqual(rpc.cwdSwitches, [repoB]);
+    assert.deepEqual(rpc.cwdSwitches, [realRepoB]);
     assert.equal(rpc.sessionPath, "/sessions/repo-b.jsonl");
-    assert.equal(bridge.currentCwd, repoB);
-    assert.equal(state.savedCwd, repoB);
+    assert.equal(bridge.currentCwd, realRepoB);
+    assert.equal(state.savedCwd, realRepoB);
     assert.match(lastSent(mesh), /^---$/m);
     assert.match(lastSent(mesh), /📂 Switched to `repo-b`/);
     assert.match(lastSent(mesh), /🔁 Resuming session `repo-b\.jsonl`/);
     // The resumed session observation persists under ITS workdir key.
-    assert.equal(state.sessions[repoB], "/sessions/repo-b.jsonl");
+    assert.equal(state.sessions[realRepoB], "/sessions/repo-b.jsonl");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -655,16 +714,17 @@ test("/cd into a repo without a pointer starts a fresh session", async () => {
       owner: OWNER,
       workdir: root,
     });
+    const realRepoC = realpathSync(repoC);
     mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd repo-c" });
     await bridge.queue;
 
-    assert.deepEqual(rpc.cwdSwitches, [repoC]);
+    assert.deepEqual(rpc.cwdSwitches, [realRepoC]);
     assert.equal(rpc.sessionPath, "/sessions/current.jsonl"); // the fresh session observed after the switch
-    assert.equal(state.savedCwd, repoC);
+    assert.equal(state.savedCwd, realRepoC);
     assert.match(lastSent(mesh), /📂 Switched to `repo-c`/);
     assert.match(lastSent(mesh), /✨ Fresh session/);
     // The fresh session (reported by get_state) persists under repo-c's key.
-    assert.equal(state.sessions[repoC], "/sessions/current.jsonl");
+    assert.equal(state.sessions[realRepoC], "/sessions/current.jsonl");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -697,7 +757,10 @@ test("/cd to the current repo is a friendly no-op", async () => {
     mesh.emitMessage({ sourceHash: OWNER_DEST, content: "/cd ." });
     await bridge.queue;
     assert.deepEqual(rpc.cwdSwitches, []);
-    assert.match(lastSent(mesh), new RegExp(`Already in ${root}.`));
+    assert.match(
+      lastSent(mesh),
+      new RegExp(`Already in ${realpathSync(root)}.`),
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -713,7 +776,11 @@ test("/cd without arguments lists the current and recent repos", async () => {
       workdir: root,
     });
     state.sessionList = [
-      { workdir: repoB, sessionFile: "/sessions/b.jsonl", mtimeMs: 2 },
+      {
+        workdir: realpathSync(repoB),
+        sessionFile: "/sessions/b.jsonl",
+        mtimeMs: 2,
+      },
       { workdir: "/somewhere/else", sessionFile: "/x.jsonl", mtimeMs: 1 },
       { workdir: null, sessionFile: "/legacy.jsonl", mtimeMs: 0 },
     ];
@@ -723,7 +790,9 @@ test("/cd without arguments lists the current and recent repos", async () => {
     assert.deepEqual(rpc.cwdSwitches, []);
     const text = lastSent(mesh);
     assert.ok(
-      text.startsWith(`**Repos**\n\n- Current: \`.\` (\`${root}\`)\n`),
+      text.startsWith(
+        `**Repos**\n\n- Current: \`.\` (\`${realpathSync(root)}\`)\n`,
+      ),
       `unexpected repo list: ${text}`,
     );
     assert.match(text, /^- Recent: `repo-b`$/m);
