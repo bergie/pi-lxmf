@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The GLM quota watcher's peak-hours warning ignored the missing-API-key disable: `maybeWarnPeak` guarded only on the z.ai-model gate, so a daemon running without a `zai` key still sent the owner a "⚠️ z.ai peak hours" message whenever a run started inside the peak window (Mon–Fri 06:00–10:00 UTC) — the reason the "missing zai key disables the watcher" unit test failed intermittently in CI. The warning path now applies the same disable as every other sending path, and the regression test pins a peak-time clock so it no longer depends on when CI runs.
 - The smoke test missed its readiness deadlines under 0.10.0's default announce stamping (the daemon's first announce waited on proof-of-work mining); the smoke rig now configures the low `stampValue` on both the owner and the daemon side.
 
 ## [0.4.0] - 2026-10-10

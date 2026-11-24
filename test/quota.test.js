@@ -152,6 +152,10 @@ test("missing zai key disables the watcher without throwing", () => {
   const { w, sent } = makeWatcher({
     apiKey: null,
     fetchImpl: liveFetch({ fiveHourPct: 100, weeklyPct: 10 }),
+    // Pin inside the peak window (Wed 08:00 UTC): this regression test
+    // covers the maybeWarnPeak path, which used to ignore the missing-key
+    // disable and fired a real warning here whenever CI ran in peak hours.
+    now: () => Date.UTC(2026, 9, 2, 8, 0, 0),
   });
   // Everything is a no-op when disabled by missing key.
   w.setEnabled(true);

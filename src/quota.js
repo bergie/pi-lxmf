@@ -548,7 +548,9 @@ export class GlmQuotaWatcher {
    * @param {string} reason - Short reason for the log line.
    */
   maybeWarnPeak(reason) {
-    if (!this.enabled) return;
+    // Same disable as every other sending path: no z.ai key means no GLM
+    // usage, so a peak-cost warning would be both wrong and noise.
+    if (!this.enabled || !this.apiKey) return;
     const nowMs = this.now();
     if (isPeakTime(nowMs)) {
       if (this.peakWarnedThisRun) return;
