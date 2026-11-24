@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
 ### Changed
 
 - Upgraded to reticulum-js 0.10.0 (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/node`), picking up the RNS 1.6.1 network-stamp parity (announces and path requests now carry proof-of-work stamps by default), link MTU discovery, the resource-transfer watchdog and window scaling from 0.9.13, a long list of unhandled-rejection/memory-bound fixes that matter for a long-running daemon, and several upstream security fixes (announce stamp enforcement bypass, LINKREQUEST payload validation, non-finite RTT teardown, unbounded resource hashmap growth).
