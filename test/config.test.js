@@ -87,6 +87,7 @@ test("defaults resolve with owner set", async () => {
   assert.equal(config.midRunBehavior, "steer");
   assert.equal(config.chunkChars, 2500);
   assert.equal(config.announceIntervalSec, null);
+  assert.equal(config.stampValue, null); // upstream 25.0 default
   assert.ok(config.configPath); // loadWith writes a real config file
 });
 
@@ -119,6 +120,7 @@ test("loads and normalises values", async () => {
     skipSharedInstance: true,
     propagationNode: "1234567890abcdef1234567890abcdef",
     syncIntervalSec: 60,
+    stampValue: 15.8,
   });
   assert.equal(config.owner, "abcdef0123456789abcdef0123456789");
   assert.equal(config.name, "my pi");
@@ -131,6 +133,7 @@ test("loads and normalises values", async () => {
   assert.equal(config.skipSharedInstance, true);
   assert.equal(config.propagationNode, "1234567890abcdef1234567890abcdef");
   assert.equal(config.syncIntervalSec, 60);
+  assert.equal(config.stampValue, 15.8); // fractional cost grid supported
   assert.ok(config.configPath);
 });
 
@@ -141,6 +144,9 @@ test("rejects invalid values", async () => {
   await assert.rejects(loadWith({ chunkChars: 0 }), ConfigError);
   await assert.rejects(loadWith({ chunkChars: 1.5 }), ConfigError);
   await assert.rejects(loadWith({ announceIntervalSec: 10 }), ConfigError);
+  await assert.rejects(loadWith({ stampValue: -1 }), ConfigError);
+  await assert.rejects(loadWith({ stampValue: 101 }), ConfigError);
+  await assert.rejects(loadWith({ stampValue: "high" }), ConfigError);
 });
 
 test("rejects broken JSON and non-objects", async () => {

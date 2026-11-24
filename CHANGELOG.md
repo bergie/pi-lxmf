@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded to reticulum-js 0.10.0 (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/node`), picking up the RNS 1.6.1 network-stamp parity (announces and path requests now carry proof-of-work stamps by default), link MTU discovery, the resource-transfer watchdog and window scaling from 0.9.13, a long list of unhandled-rejection/memory-bound fixes that matter for a long-running daemon, and several upstream security fixes (announce stamp enforcement bypass, LINKREQUEST payload validation, non-finite RTT teardown, unbounded resource hashmap growth).
+- The daemon now installs `@reticulum/node`'s fast `node:crypto` stamp engine (`useNodeStamper()` before the transport boots, `stopNodeStamper()` on shutdown): with 0.10.0's default stamp emission the proof-of-work is mined inline in the awaited first announce, and the fast engine (worker-thread mining, workblock LRU cache) keeps that off the event loop and roughly an order of magnitude faster than the WebCrypto default.
+
+### Added
+
+- `stampValue` config field: the announce stamp proof-of-work target. The default (`null`) keeps the upstream 25.0 — mesh-compatible, but measured at ~86 s of inline mining per restart even on an M-series Mac (minutes on Termux/RPi-class hardware), during which the daemon is unavailable; the smoke test rig sets `12` to keep startup fast. Lower values trade announce proof-of-work for startup speed and are accepted everywhere while stamp enforcement remains off across the network.
+
+### Fixed
+
+- The smoke test missed its readiness deadlines under 0.10.0's default announce stamping (the daemon's first announce waited on proof-of-work mining); the smoke rig now configures the low `stampValue` on both the owner and the daemon side.
+
 ## [0.4.0] - 2026-10-10
 
 ### Security

@@ -23,7 +23,9 @@ import {
   AutoInterface,
   FileStorageAdapter,
   LocalClientInterface,
+  stopNodeStamper,
   TCPClientInterface,
+  useNodeStamper,
 } from "@reticulum/node";
 import { createBz2 } from "./bz2.js";
 import { chunkText } from "./text.js";
@@ -284,10 +286,25 @@ export async function startLxmf(config, options = {}) {
   // without a provider they transfer uncompressed over slow links.
   const bz2 = await createBz2();
 
+  // reticulum-js 0.10.0 enables RNS 1.6.1 announce/path-request stamping by
+  // default, mining the proof-of-work inline inside awaited announce() calls.
+  // Install @reticulum/node's fast node:crypto engine (worker-thread mining,
+  // workblock LRU cache) before the transport boots so every stamp operation
+  // in the process — including interface-discovery validation during
+  // rns.ready() — uses it. Released in stop() below.
+  useNodeStamper();
+
   const storageDir = join(config.dataDir, "storage");
   const rns = new Reticulum({
     storageAdapter: new FileStorageAdapter(storageDir),
     compressionProvider: bz2,
+    // Announce stamp proof-of-work target (RNS 1.6.1). null keeps the
+    // upstream default (25.0) — mesh-compatible, but mined inline in the
+    // awaited first announce, so test rigs configure a lower value to keep
+    // startup fast.
+    ...(config.stampValue !== null
+      ? { stamps: { destinationValue: config.stampValue } }
+      : {}),
   });
   // Persistor hydration and background services (interface discovery) must
   // be settled before the identity is loaded and announces go out.
@@ -507,6 +524,7 @@ export async function startLxmf(config, options = {}) {
       detachDiagnostics();
       lxmf.stopAnnouncing();
       if (syncTimer) clearInterval(syncTimer);
+      stopNodeStamper();
     },
   };
 }

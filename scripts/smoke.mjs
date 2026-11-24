@@ -65,6 +65,10 @@ try {
   // --- The fake owner: a second LXMF node on the same rnsd ----------------
   const ownerRns = new Reticulum({
     storageAdapter: new FileStorageAdapter(join(work, "owner-storage")),
+    // Test rig: low announce-stamp value so first announces are not held
+    // back by inline proof-of-work mining (production keeps the 25.0
+    // upstream default; see the `stampValue` config field).
+    stamps: { destinationValue: 12 },
   });
   const shared = await LocalClientInterface.connectToSharedInstance();
   if (!shared)
@@ -99,6 +103,7 @@ try {
         dataDir,
         chunkChars: 100,
         announceIntervalSec: 60,
+        stampValue: 12,
         owner: toHex(ownerIdentity.identityHash),
       },
       null,

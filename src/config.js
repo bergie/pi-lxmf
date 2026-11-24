@@ -27,6 +27,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { STAMP_COST_CAP } from "@reticulum/core/src/utils/stamps.js";
 
 /** Thrown for unusable configuration (bad path, bad JSON, invalid values). */
 export class ConfigError extends Error {
@@ -66,6 +67,10 @@ const HEX32_RE = /^[0-9a-fA-F]{32}$/;
  * @property {"steer"|"followUp"} midRunBehavior - streamingBehavior for mid-run prompts.
  * @property {number} chunkChars - Max characters per outbound LXMF message.
  * @property {number|null} announceIntervalSec - Re-announce cadence.
+ * @property {number|null} stampValue - Target announce stamp value (RNS 1.6.1
+ *   proof-of-work). `null` keeps the reticulum-js/upstream default (25.0,
+ *   ~minutes of inline mining per restart on low-power hardware); lower
+ *   values trade announce proof-of-work for startup speed (test rigs).
  * @property {string|null} configPath - Config file the values came from.
  */
 
@@ -123,6 +128,26 @@ function boolField(value, field, fallback) {
 }
 
 /**
+ * Announce stamp target value: a finite number in [0, STAMP_COST_CAP] (the
+ * RNS fractional cost grid supports halves like 15.8), or null for the
+ * reticulum-js/upstream default (25.0).
+ *
+ * @param {unknown} value
+ * @param {string} field
+ * @returns {number|null}
+ */
+function stampValueField(value, field) {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > STAMP_COST_CAP) {
+    throw new ConfigError(
+      `Config field "${field}" must be a number between 0 and ${STAMP_COST_CAP}, got: ${JSON.stringify(value)}`,
+    );
+  }
+  return n;
+}
+
+/**
  * Default config file path (`$PI_LXMF_CONFIG`, then XDG).
  *
  * @param {Record<string, string|undefined>} [env] - Defaults to `process.env`.
@@ -166,6 +191,7 @@ const KNOWN_KEYS = {
   midRunBehavior: {},
   chunkChars: {},
   announceIntervalSec: {},
+  stampValue: {},
 };
 
 /**
@@ -279,6 +305,7 @@ export async function loadConfig(options = {}) {
       raw.announceIntervalSec === undefined || raw.announceIntervalSec === null
         ? null
         : intField(raw.announceIntervalSec, "announceIntervalSec", 0, 60),
+    stampValue: stampValueField(raw.stampValue, "stampValue"),
     configPath,
   };
 }
